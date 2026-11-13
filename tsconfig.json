@@ -1,0 +1,23 @@
+{
+  // Le Worker (src/) et ses tests (tests/), dans le moteur de Cloudflare (workerd).
+  // Les types des liaisons et du runtime viennent de `wrangler types` (worker-configuration.d.ts).
+  "compilerOptions": {
+    "strict": true,
+    "target": "es2024",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2024"],
+    "types": ["./worker-configuration.d.ts", "@cloudflare/vitest-plugin/types"],
+    "skipLibCheck": true,
+    "noEmit": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": false
+  },
+  "include": ["src", "tests", "live", "worker-configuration.d.ts"]
+}

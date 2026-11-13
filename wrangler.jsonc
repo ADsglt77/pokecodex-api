@@ -1,0 +1,99 @@
+// PokéCodex — importateur TCGdex FR/JP (Worker indépendant du site et de l'API des données).
+// Aucune route ni domaine de pokecodex.fr : l'administration passe par l'adresse workers.dev,
+// protégée par le secret ADMIN_TOKEN (`wrangler secret put ADMIN_TOKEN`, jamais dans ce fichier).
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pokecodex-importer",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-10",
+  // Le travail est surtout de l'attente réseau (TCGdex, R2, D1), qui ne compte pas dans le CPU.
+  // Le CPU d'un Cron dont l'intervalle est inférieur à une heure est plafonné à 30 s.
+  "limits": { "cpu_ms": 30000 },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "pokecodex-cards",
+      "database_id": "7a534301-31ff-4d62-b42c-f5d1e3800e51",
+      "preview_database_id": "DB",
+      "migrations_dir": "migrations",
+    },
+  ],
+  // Bucket existant, réutilisé : l'importateur n'écrit que sous `cards/` (images) et `reports/`
+  // (rapports). Le bucket reste privé : aucun domaine public n'est configuré.
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pokedex-data" }],
+  "triggers": {
+    // Toutes les 5 minutes : traitement des tâches en attente (une exécution à la fois, verrou D1).
+    // Le lundi à 03:07 UTC (hors des multiples de 5, pour ne pas croiser le traitement) :
+    // synchronisation hebdomadaire du catalogue FR et JP.
+    // Attention : chez Cloudflare, les jours numériques vont de 1 = dimanche à 7 = samedi ; les
+    // abréviations (MON) évitent toute ambiguïté.
+    "crons": ["*/5 * * * *", "7 3 * * MON"],
+  },
+  "vars": {
+    // Doivent correspondre exactement aux expressions de `triggers.crons` ci-dessus.
+    "PROCESS_CRON": "*/5 * * * *",
+    "SYNC_CRON": "7 3 * * MON",
+    "LANGUAGES": "fr,ja",
+    "TCGDEX_API_BASE": "https://api.tcgdex.net/v2",
+    // Agent utilisateur générique (aucune donnée personnelle).
+    "USER_AGENT": "tcgdex-r2-importer/1.0",
+    // Débit : au moins 250 ms entre deux requêtes vers TCGdex (≈ 4 requêtes/s au maximum, sur
+    // l'API et le CDN réunis, quel que soit le nombre de voies). Démarré à 2 voies simultanées ;
+    // passé à 4 le 13/11/2026 : une copie d'image prend ≈ 2,5 s par voie (CDN hors Cloudflare + R2),
+    // 2 voies ne donnaient que ≈ 0,8 image/s. 4 voies + D1/R2 restent sous les 6 connexions.
+    "MAX_CONCURRENCY": "4",
+    "MIN_REQUEST_INTERVAL_MS": "250",
+    "MAX_REQUEST_INTERVAL_MS": "5000",
+    // Budget d'une exécution : 4 min (le Cron suivant arrive après 5 min), 900 tâches, 850
+    // requêtes D1 (limite Cloudflare : 1 000 par invocation, un batch compte pour 1) et 5 000
+    // sous-requêtes (limite par défaut : 10 000).
+    "RUN_TIME_BUDGET_MS": "240000",
+    "MAX_JOBS_PER_RUN": "900",
+    "CLAIM_BATCH_SIZE": "10",
+    "D1_QUERY_BUDGET": "850",
+    "SUBREQUEST_BUDGET": "5000",
+    // Verrous : celui de l'exécuteur (une seule exécution à la fois) et celui de chaque tâche.
+    "RUNNER_LEASE_MS": "360000",
+    "JOB_LEASE_MS": "600000",
+    // Nouvelles tentatives : 5 au plus, délai exponentiel de 1 min à 6 h. Une tâche rendue sans
+    // consommer de tentative (429, dépendance pas prête) l'est 48 fois au plus.
+    "MAX_ATTEMPTS": "5",
+    "MAX_RELEASES": "48",
+    "RETRY_BASE_MS": "60000",
+    "RETRY_MAX_MS": "21600000",
+    "FETCH_TIMEOUT_MS": "30000",
+    // Attente imposée après un HTTP 429 sans Retry-After (doublée à chaque 429 consécutif, plafond
+    // ci-dessous) ; un Retry-After explicite est respecté jusqu'à 24 h.
+    "RATE_LIMIT_BACKOFF_MS": "120000",
+    "RATE_LIMIT_MAX_BACKOFF_MS": "3600000",
+    // Après autant d'erreurs serveur ou réseau consécutives, pause automatique de 15 min.
+    "ERROR_STREAK_LIMIT": "10",
+    "ERROR_STREAK_BACKOFF_MS": "900000",
+    // Images : qualité principale et qualité de secours (vide = pas de secours) pour une URL
+    // officielle ; une seule URL reconstruite par carte (le sondage du CDN n'a trouvé aucune
+    // variante utile : ni zéros de tête, ni casse différente, ni autre langue).
+    "IMAGE_QUALITY": "high",
+    "FALLBACK_QUALITY": "low",
+    "MAX_RECONSTRUCTION_URLS": "1",
+    "MIN_IMAGE_BYTES": "100",
+    "MAX_IMAGE_BYTES": "8000000",
+    "MAX_JSON_BYTES": "8000000",
+    // Plafonds de coût : pause automatique au-delà de 20 Go stockés ; au-delà de 150 000
+    // opérations (requêtes TCGdex + écritures R2) dans la journée UTC, arrêt jusqu'au lendemain.
+    "MAX_STORED_BYTES": "20000000000",
+    "MAX_DAILY_OPERATIONS": "150000",
+    // Synchronisation : détail des cartes rafraîchi au plus tous les 90 jours (TCGdex demande de
+    // ménager son API ; les changements de nom ou d'image sont, eux, vus chaque semaine) ; images manquantes
+    // revérifiées au plus tous les 30 jours (le CDN reçoit parfois des images après coup).
+    "DETAIL_REFRESH_DAYS": "90",
+    "MISSING_RECHECK_DAYS": "30",
+  },
+  // Adresse workers.dev pour l'administration (protégée) ; pas d'adresses d'aperçu.
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true, "head_sampling_rate": 1 },
+    "traces": { "enabled": true, "head_sampling_rate": 0.05 },
+  },
+}
