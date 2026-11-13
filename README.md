@@ -3,7 +3,8 @@
 Worker Cloudflare autonome qui construit la base de cartes de PokéCodex à partir de
 [TCGdex](https://tcgdex.dev) : toutes les séries, extensions et cartes **françaises** et
 **japonaises** répertoriées par TCGdex, avec leurs images `high.webp` copiées directement de TCGdex
-vers R2 (TCGdex → Worker → R2, sans passer par un ordinateur).
+vers R2 (TCGdex → Worker → R2, sans passer par un ordinateur). Pour l'affichage du site, il copie
+aussi la petite image `low.webp` de chaque carte (grilles) et le logo de chaque extension qui en a un.
 
 L'application est **indépendante** du site `pokecodex.fr` : son propre Worker (`pokecodex-importer`),
 sa propre base D1 (`pokecodex-cards`), aucune route ni domaine du site. Elle réutilise seulement le
@@ -21,8 +22,9 @@ bucket R2 existant `pokedex-data`, où elle n'écrit que sous `cards/` (images) 
           ┌───────────────────────────────┼────────────────────────────────┐
           ▼                               ▼                                ▼
    D1 pokecodex-cards               api.tcgdex.net/v2                assets.tcgdex.net
-   (catalogue, tâches,              (séries, extensions,             (images high.webp)
-    verrous, bilans)                 cartes)                                │
+   (catalogue, tâches,              (séries, extensions,             (high.webp, low.webp,
+    verrous, bilans)                 cartes)                          logos d'extension)
+                                                                            │
                                                                             ▼
                                                               R2 pokedex-data / cards/<langue>/…
 ```
@@ -37,11 +39,16 @@ bucket R2 existant `pokedex-data`, où elle n'écrit que sous `cards/` (images) 
 - **Tâches** (`import_jobs`), par ordre de priorité :
   `catalog` (séries + extensions d'une langue) → `set` (détail d'une extension et de ses cartes) →
   `card_index` (cartes de `/cards` absentes des extensions) → `report` → `image` (copie vers R2) →
-  `card` (détail : rareté, catégorie, illustrateur, JSON brut). Les images passent avant les détails
-  pour que les premières copies arrivent dès le début.
-- **`src/services/downloader.ts`** : la copie d'une image ; **`src/services/catalog.ts`**,
-  **`cards.ts`** : catalogue et détails ; **`reports.ts`**, **`stats.ts`** : audit, exports,
-  statistiques ; **`sync.ts`** : démarrer, pause, reprise, relance.
+  `card` (détail : rareté, catégorie, illustrateur, JSON brut) → copies secondaires (petite image
+  `low.webp` d'une carte, logo d'une extension). Les images passent avant les détails pour que les
+  premières copies arrivent dès le début ; les copies secondaires passent après tout le reste
+  (priorité 6). Ce sont des tâches de type `image` (la contrainte CHECK de `job_type` n'est pas
+  reconstruite), reconnues à leur charge utile `{"media":"low"}` / `{"media":"logo"}` et à leur
+  `dedupe_key` : `image_low:<langue>:<carte>`, `logo:<langue>:<extension>`.
+- **`src/services/downloader.ts`** : la copie d'une image ; **`src/services/media.ts`** : petites
+  images et logos ; **`src/services/catalog.ts`**, **`cards.ts`** : catalogue et détails ;
+  **`reports.ts`**, **`stats.ts`** : audit, exports, statistiques ; **`sync.ts`** : démarrer, pause,
+  reprise, relance, rattrapage des petites images et logos.
 - **`src/repositories/`** : accès D1 (requêtes paramétrées ; écritures en masse par un seul
   paramètre JSON `json_each`, sous la limite de 100 paramètres de D1).
 - **`src/tcgdex/`** : client HTTP (débit, délais, relances courtes), parseurs validés, URL d'images
@@ -53,7 +60,7 @@ bucket R2 existant `pokedex-data`, où elle n'écrit que sous `cards/` (images) 
 | --- | --- | --- |
 | Worker | `pokecodex-importer` | administration + Cron, adresse `*.workers.dev` uniquement |
 | D1 | `pokecodex-cards` (WEUR, `7a534301-31ff-4d62-b42c-f5d1e3800e51`) | catalogue, tâches, bilans |
-| R2 | `pokedex-data` (existant, **privé**) | `cards/…` (images), `reports/…` (rapports) |
+| R2 | `pokedex-data` (existant, **privé**) | `cards/…` (images, petites images, logos), `reports/…` (rapports) |
 | Cron | `*/5 * * * *` | traitement des tâches |
 | Cron | `7 3 * * MON` | synchronisation hebdomadaire du catalogue (hors des multiples de 5) |
 | Secret | `ADMIN_TOKEN` | jeton de l'API d'administration |
@@ -102,6 +109,11 @@ npx wrangler secret put ADMIN_TOKEN      # jeton aléatoire d'au moins 32 caract
 Le jeton d'administration de ce déploiement est rangé localement dans
 `.secrets/admin-token.txt` (ignoré par Git). Ne jamais le committer ni le coller dans un ticket.
 
+Petites images et logos (migration `0002_media.sql`, uniquement des `ALTER TABLE … ADD COLUMN` et un
+index) : appliquer la migration **avant** de déployer le code qui lit ces colonnes, entre deux Cron
+(hors d'une exécution en cours, voir `GET /admin/status`), puis appeler une fois
+`POST /admin/sync/backfill-media` pour le catalogue déjà importé.
+
 ## D1 (`pokecodex-cards`)
 
 Migrations dans `migrations/`. Tables :
@@ -112,6 +124,16 @@ Migrations dans `migrations/`. Tables :
   avec les identifiants produits (`thirdParty.cardmarket`), utiles pour la suite.
 - `cards.image_*` : statut, clé R2, qualité, taille, SHA-256, date, URL testées, code HTTP et motif
   d'échec.
+- `cards.image_low_*` (migration `0002_media.sql`) : petite image `low.webp` — `image_low_status`,
+  `image_low_r2_key`, `image_low_checked_at`, `image_low_file_size` (NULL quand la petite image
+  réutilise l'objet principal), `image_low_sha256`, `image_low_failure_reason`.
+- `sets.logo_*` (même migration) : logo de l'extension — `logo_status`, `logo_r2_key`,
+  `logo_checked_at`, `logo_source_url` (URL testée), `logo_file_size`, `logo_sha256`,
+  `logo_failure_reason`.
+- Contrat avec le site (API de données) : il lit `image_low_status`, `image_low_r2_key`,
+  `logo_status` et `logo_r2_key` ; **`downloaded` est le seul statut qui signifie « présent »**
+  (contraintes CHECK : `downloaded`, `not_found_on_cdn`, `missing_api_url`, `download_error`,
+  `invalid_image` ; NULL = jamais traité).
 - `import_jobs` : la file persistante (une ligne par cible, `dedupe_key` unique, verrou expirant).
 - `sync_runs` : une synchronisation par langue, avec son bilan réel à la clôture.
 - `tick_runs` : les exécutions qui ont eu du travail ; `runtime_state` : verrou, pause, attente
@@ -127,15 +149,21 @@ synchronisation ne crée aucun doublon.
 ```
 pokedex-data/
 ├── cards/
-│   ├── fr/<extension>/<carte>.webp      ex. cards/fr/swsh3/swsh3-136.webp
-│   └── ja/<extension>/<carte>.webp      ex. cards/ja/SV1a/SV1a-001.webp
+│   ├── fr/<extension>/<carte>.webp      ex. cards/fr/swsh3/swsh3-136.webp       (high.webp)
+│   ├── fr/<extension>/<carte>.low.webp  ex. cards/fr/swsh3/swsh3-136.low.webp   (low.webp)
+│   ├── fr/<extension>/_logo.webp        ex. cards/fr/swsh3/_logo.webp           (logo)
+│   └── ja/<extension>/<carte>.webp      ex. cards/ja/SV1a/SV1a-001.webp (et .low.webp)
 └── reports/
     ├── latest/{summary.json, summary.csv, missing_fr.csv, missing_ja.csv, errors.csv}
     └── history/<date>/summary.{json,csv}
 ```
 
 Les segments de clé sont encodés de façon sûre et réversible : seuls `A-Z a-z 0-9 . -` restent tels
-quels, tout autre octet devient `_XX` (ex. `exu-%3F` → `exu-_253F`, `SM1+` → `SM1_2B`).
+quels, tout autre octet devient `_XX` (ex. `exu-%3F` → `exu-_253F`, `SM1+` → `SM1_2B`). La clé de
+la petite image est celle de l'image principale, `.webp` remplacé par `.low.webp` ; si l'image
+principale est déjà en qualité `low` (secours), la petite image réutilise la même clé, sans copie.
+Le segment `_logo` ne peut pas venir d'une carte : l'encodage n'écrit `_` que suivi de deux
+chiffres hexadécimaux majuscules.
 
 Chaque image est lue en flux dans une limite de taille, gardée en mémoire le temps de la validation
 (≈ 90 Ko en moyenne), validée (statut 200, type `image/webp`, signature `RIFF…WEBP`, taille RIFF,
@@ -158,6 +186,39 @@ public n'est configuré (les images sont des œuvres protégées).
 
 Statuts : `pending`, `downloaded`, `recovered_from_cdn`, `already_present`, `missing_api_url`,
 `not_found_on_cdn`, `download_error`, `invalid_image`.
+
+## Petites images et logos
+
+- **Petite image** (pour les grilles du site) : pour chaque carte dont l'image principale est valide
+  (`downloaded`, `recovered_from_cdn`, `already_present`), `low.webp` de la même base que
+  `image_source_url` (qualité `low` au lieu de `high`), copiée à `….low.webp`. Image principale
+  déjà en `low` : enregistrée telle quelle comme petite image (même clé, aucun téléchargement).
+- **Logo** : pour chaque extension dont l'API donne un `logo` (beaucoup d'extensions FR, aucune JP),
+  `<logo>.webp`, copié à `cards/<langue>/<extension>/_logo.webp` ; seulement sur assets.tcgdex.net,
+  dans la langue de l'extension (ou `univ`).
+- **Mêmes garanties que l'image principale** : même client (≤ 4 requêtes/s au total, https,
+  aucune redirection), même validation (statut, `image/webp`, RIFF…WEBP, tailles, MD5 = ETag),
+  écriture R2 avec contrôle SHA-256 puis D1 ; un objet valide n'est jamais écrasé (déjà présent :
+  réconcilié en `downloaded` ; objet d'une autre cible à la même clé : jamais remplacé) ; 404 →
+  `not_found_on_cdn` sans nouvelle tentative ; 429, 5xx, réseau : comme l'image principale. Les
+  plafonds de coût les comptent : requêtes et écritures R2 dans `MAX_DAILY_OPERATIONS`, octets
+  dans `MAX_STORED_BYTES`.
+- **Création des tâches** (priorité la plus basse) :
+  1. par chaque tâche `set` (import et synchronisation hebdomadaire) : petite image de chaque carte
+     dont l'image principale est valide ou cherchée par cette même tâche, et logo de l'extension ;
+     seulement si la copie manque : jamais traitée, ou absente / en erreur depuis plus de
+     `MISSING_RECHECK_DAYS` (30) jours, ou (logo) URL changée. Une petite image n'attend pas son
+     image principale (des rendus répétés pendant une longue file d'images principales useraient
+     `MAX_RELEASES`) : sans image principale valide, sa tâche se termine aussitôt, sans requête ni
+     écriture ; c'est la copie réussie de l'image principale (téléchargée ou `already_present`) qui
+     remet en attente sa tâche de petite image terminée, sans jamais en créer. Seule exception :
+     réservée dans le même lot que son image principale en cours de copie, la tâche est rendue
+     1 min (sinon cette remise en attente, écrite avant sa clôture, serait perdue) ;
+  2. par `POST /admin/sync/backfill-media` : toutes les petites images et logos manquants (même règle)
+     des cartes et extensions existantes, par pages de 500 (`json_each`), sans doublon de tâche
+     active. À appeler une fois après le déploiement, pour le catalogue déjà importé.
+- Statuts : `downloaded` (présent), `not_found_on_cdn`, `missing_api_url` (aucune URL source
+  fiable), `download_error`, `invalid_image` ; NULL = pas encore traité.
 
 ## Gestion des erreurs
 
@@ -199,7 +260,8 @@ Le lundi à 03:07 UTC, une synchronisation `weekly` par langue :
   est traitée comme une anomalie) ; les cartes de l'index `/cards` absentes de toute extension sont
   créées et importées quand même ;
 - relance la recherche des images manquantes de plus de 30 jours (le CDN reçoit parfois des images
-  après coup) ;
+  après coup) ; de même pour les petites images et les logos (un logo dont l'URL change est
+  revérifié tout de suite) ;
 - rafraîchit le détail des cartes de plus de 90 jours (TCGdex demande de ménager son API) ;
 - ne retélécharge jamais une image valide ;
 - produit un nouvel audit et de nouveaux rapports à la fin.
@@ -225,7 +287,7 @@ Ou avec curl : `curl -s -H "Authorization: Bearer $(cat .secrets/admin-token.txt
 
 | Route | Effet |
 | --- | --- |
-| `GET /admin/status` | rapport texte (`?format=json` pour du JSON) |
+| `GET /admin/status` | rapport texte (`?format=json` pour du JSON), petites images et logos compris |
 | `GET /admin/stats` | statistiques détaillées (`?sets=1` : par extension) |
 | `GET /admin/missing` | cartes sans image (`?language=fr` facultatif, `limit`, `after`) |
 | `GET /admin/errors` | images en erreur et tâches en échec |
@@ -234,7 +296,8 @@ Ou avec curl : `curl -s -H "Authorization: Bearer $(cat .secrets/admin-token.txt
 | `POST /admin/sync/start` | démarre une synchronisation (`?language=fr,ja`, `?sets=swsh3,SV1a`) |
 | `POST /admin/sync/pause`, `POST /admin/sync/resume` | pause, reprise (la reprise lève aussi une attente imposée et le signale) |
 | `POST /admin/sync/cancel` | abandonne les synchronisations en cours (`?language=`) ; les tâches continuent |
-| `POST /admin/sync/retry-missing` | relance images manquantes/en erreur et tâches en échec |
+| `POST /admin/sync/retry-missing` | relance images manquantes/en erreur et tâches en échec (petites images et logos compris pour les tâches en échec) |
+| `POST /admin/sync/backfill-media` | crée les tâches des petites images et logos manquants (`?language=fr,ja`) ; rend `{ lowImages, logos, complete }` (`complete: false` : rappeler la route) |
 | `POST /admin/reports/generate` | nouvel audit et nouveaux exports |
 | `POST /admin/tick` | une exécution courte tout de suite (20 s au plus, `?max_jobs=`) |
 | `POST /admin/selftest` | vérifie D1, R2 et l'accès à TCGdex |
@@ -256,7 +319,10 @@ Abonnement Workers Paid (5 $/mois) déjà en place ; aucune autre souscription. 
 
 Requêtes vers TCGdex : ≈ 71 000 pour l'import initial (mesuré le 13/11 : ≈ 800 tâches par exécution
 de 4 min avec 2 voies, soit ≈ 7 à 8 h au total ; 4 voies depuis, plafond global inchangé),
-puis ≈ 3 000 à 6 000 par semaine. Garde-fous configurables : pause automatique au-delà de 20 Go
+puis ≈ 3 000 à 6 000 par semaine. Petites images et logos : en plus, une requête et une écriture R2
+par carte à image valide (≈ 24 000 à 27 000, soit ≈ 2 à 3 h de Cron) et par extension à logo
+(quelques centaines), pour un volume bien inférieur à celui des images `high` (non mesuré : suivre
+« Volume stocké » dans `GET /admin/status`). Garde-fous configurables : pause automatique au-delà de 20 Go
 stockés, arrêt au-delà de 150 000 opérations par jour UTC. Ces limites réduisent le risque mais **ne
 garantissent pas** à elles seules un plafond de facture : surveillez l'alerte budgétaire du compte.
 
@@ -264,7 +330,9 @@ garantissent pas** à elles seules un plafond de facture : surveillez l'alerte b
 
 - Le site pourra lire `pokecodex-cards` (liaison D1 en lecture) ou un export, et servir les images de
   `cards/…` par son propre Worker (le bucket reste privé ; aucun domaine public sans validation des
-  droits).
+  droits). Son API de données lit `image_low_status` / `image_low_r2_key` (grilles) et
+  `logo_status` / `logo_r2_key` (extensions) : `downloaded` = présent ; sinon (pas encore copiée,
+  introuvable sur le CDN), le site doit prévoir un repli (image principale `image_r2_key`, pas de logo).
 - Les prix et liens marketplaces iront dans `card_marketplace_links` ; les identifiants produits
   Cardmarket de TCGdex sont déjà dans `metadata_json` (`variants_detailed[].thirdParty.cardmarket`).
   Aucune API payante, aucun scraping de Cardmarket, aucune donnée de marché inventée.

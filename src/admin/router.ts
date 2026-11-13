@@ -13,6 +13,7 @@
  *   POST /admin/sync/resume            reprend (lève aussi une attente imposée, signalée en retour)
  *   POST /admin/sync/cancel            abandonne les synchronisations en cours (?language=)
  *   POST /admin/sync/retry-missing     relance images manquantes / en erreur et tâches en échec
+ *   POST /admin/sync/backfill-media    crée les tâches des petites images et logos manquants (?language=)
  *   POST /admin/reports/generate       demande un nouvel audit et de nouveaux exports
  *   POST /admin/tick                   lance une exécution courte (10 s au plus) tout de suite (?max_jobs=)
  *   POST /admin/selftest               vérifie D1, R2 et l'accès à TCGdex
@@ -25,7 +26,7 @@ import { enqueueStmts } from '../repositories/jobs'
 import { failedJobs, problemCards, setCoverage } from '../services/reports'
 import { runTick } from '../services/runner'
 import { collectStats, formatStatus } from '../services/stats'
-import { cancelSync, pauseSync, resumeSync, retryMissing, startSync } from '../services/sync'
+import { backfillMedia, cancelSync, pauseSync, resumeSync, retryMissing, startSync } from '../services/sync'
 import { Health, TcgdexClient } from '../tcgdex/client'
 import { parseSeriesList } from '../tcgdex/types'
 import { RateLimiter } from '../utils/limiter'
@@ -70,6 +71,7 @@ const POST_ROUTES = [
   '/admin/sync/resume',
   '/admin/sync/cancel',
   '/admin/sync/retry-missing',
+  '/admin/sync/backfill-media',
   '/admin/reports/generate',
   '/admin/tick',
   '/admin/selftest',
@@ -203,6 +205,12 @@ export async function handleAdmin(request: Request, deps: AdminDeps): Promise<Re
         const languages = languagesParam(url, config)
         if (!languages) return json({ error: 'langue inconnue (fr ou ja)' }, 400)
         return json(await retryMissing(db, config, now(), languages))
+      }
+      if (path === '/admin/sync/backfill-media') {
+        const languages = languagesParam(url, config)
+        if (!languages) return json({ error: 'langue inconnue (fr ou ja)' }, 400)
+        const result = await backfillMedia(db, config, now(), languages)
+        return json({ ...result, note: result.complete ? 'tâches créées : la prochaine exécution les traitera (après toutes les autres tâches)' : 'plafond de pages atteint : rappelez la route pour la suite' })
       }
       if (path === '/admin/reports/generate') {
         await db.batch(enqueueStmts(db, 'report', null, [{ target: null, cardId: null, dedupeKey: 'report:*:*', payload: { manual: true } }], { runId: null, maxAttempts: config.maxAttempts, nowMs: now() }))

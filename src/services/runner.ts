@@ -17,7 +17,7 @@
 
 import type { Config } from '../config'
 import { Db, Usage } from '../db'
-import { cardsForJobs, imageFailureStmt, type CardForJob } from '../repositories/catalog'
+import { cardsForJobs, setsForLogoJobs, type CardForJob, type SetForLogoJob } from '../repositories/catalog'
 import {
   claimJobs,
   completeStmt,
@@ -25,6 +25,7 @@ import {
   failStmt,
   guardStmt,
   hasWork,
+  mediaKind,
   reclaimExpired,
   releaseStmt,
   retryDelayMs,
@@ -47,6 +48,7 @@ import {
 } from '../repositories/state'
 import { Health, TcgdexClient } from '../tcgdex/client'
 import { RETRY_AFTER_MAX_MS } from '../utils/http'
+import { internalId } from '../utils/keys'
 import { RateLimiter } from '../utils/limiter'
 import { errorMessage, log, logError } from '../utils/log'
 import { iso, sleep } from '../utils/time'
@@ -54,6 +56,7 @@ import { imageJob, runCardIndexJob, runCatalogJob, runSetJob } from './catalog'
 import { runCardJob } from './cards'
 import { jobPayload, type JobContext, type JobResult } from './context'
 import { runImageJob } from './downloader'
+import { imageJobFailureStmts, runLogoJob, runLowImageJob } from './media'
 import { runReportJob } from './reports'
 
 export interface RunnerDeps {
@@ -153,15 +156,10 @@ export async function runTick(deps: RunnerDeps, opts: TickOptions): Promise<Tick
     }
 
     // 3. Tâches d'une exécution interrompue.
+    // Tâche d'image (principale, petite image ou logo) épuisée : sa cible passe en download_error.
     const expiredFailures = await reclaimExpired(db, now())
-    const lostImages = expiredFailures.filter((job) => job.job_type === 'image' && job.card_id)
-    if (lostImages.length) {
-      await db.batch(
-        lostImages.map((job) =>
-          imageFailureStmt(db, job.card_id as string, { status: 'download_error', reason: 'verrou expiré : nombre maximal de tentatives atteint', testedUrls: '[]', httpStatus: null }, now()),
-        ),
-      )
-    }
+    const lostImages = expiredFailures.flatMap((job) => imageJobFailureStmts(db, job, 'verrou expiré : nombre maximal de tentatives atteint', now()))
+    if (lostImages.length) await db.batch(lostImages)
 
     // 4. Plafond de stockage.
     const opsBefore = dailyOperations(state, startMs)
@@ -218,6 +216,9 @@ export async function runTick(deps: RunnerDeps, opts: TickOptions): Promise<Tick
       counters.claimed += jobs.length
       const cardIds = jobs.filter((job) => (job.job_type === 'card' || job.job_type === 'image') && job.card_id).map((job) => job.card_id as string)
       const cards = await cardsForJobs(db, cardIds)
+      // Extensions des tâches de logo (une requête de plus, seulement si le lot en contient).
+      const logoSetId = (job: Job): string | null => (mediaKind(job) === 'logo' && job.language && job.target_id ? internalId(job.language, job.target_id) : null)
+      const sets = await setsForLogoJobs(db, jobs.map(logoSetId).filter((id): id is string => id !== null))
 
       const results = await mapPool(jobs, config.maxConcurrency, async (job): Promise<JobResult> => {
         // Budget dépassé avant le début de la tâche : rendue intacte pour l'exécution suivante.
@@ -225,7 +226,8 @@ export async function runTick(deps: RunnerDeps, opts: TickOptions): Promise<Tick
           return { kind: 'release', reason: 'exécution arrêtée avant cette tâche', httpStatus: null, delayMs: 0 }
         }
         try {
-          return await runJob(ctx, job, job.card_id ? cards.get(job.card_id) : undefined)
+          const setId = logoSetId(job)
+          return await runJob(ctx, job, job.card_id ? cards.get(job.card_id) : undefined, setId ? sets.get(setId) : undefined)
         } catch (jobError) {
           logError('job_exception', jobError, { jobId: job.id, type: job.job_type })
           return { kind: 'retry', error: `exception : ${errorMessage(jobError)}`, httpStatus: null }
@@ -315,7 +317,7 @@ function skipReason(state: Map<string, StateRow>, config: Config, nowMs: number)
 }
 
 /** Aiguille une tâche vers son traitement. */
-async function runJob(ctx: JobContext, job: Job, card: CardForJob | undefined): Promise<JobResult> {
+async function runJob(ctx: JobContext, job: Job, card: CardForJob | undefined, set: SetForLogoJob | undefined): Promise<JobResult> {
   switch (job.job_type) {
     case 'catalog':
       return runCatalogJob(ctx, job)
@@ -325,8 +327,13 @@ async function runJob(ctx: JobContext, job: Job, card: CardForJob | undefined): 
       return runCardIndexJob(ctx, job)
     case 'card':
       return runCardJob(ctx, job, card)
-    case 'image':
+    case 'image': {
+      // Copies secondaires (petite image, logo) : même type de tâche, priorité la plus basse.
+      const media = mediaKind(job)
+      if (media === 'low') return runLowImageJob(ctx, job, card)
+      if (media === 'logo') return runLogoJob(ctx, job, set)
       return runImageJob(ctx, job, card)
+    }
     case 'report':
       return runReportJob(ctx, job)
   }
@@ -336,7 +343,8 @@ type Outcome = 'done' | 'failed' | 'retried' | 'released'
 
 /**
  * Écritures de clôture d'une tâche, précédées du garde-fou de verrou. Une tâche d'image qui échoue
- * définitivement sans motif propre passe sa carte en `download_error` (visible et relançable).
+ * définitivement sans motif propre passe sa cible (image principale, petite image ou logo) en
+ * `download_error` (visible et relançable).
  * Une tâche rendue trop souvent (`maxReleases`) consomme désormais une tentative : jamais de boucle.
  */
 function closingStatements(
@@ -348,12 +356,11 @@ function closingStatements(
   random: () => number,
 ): { statements: D1PreparedStatement[]; outcome: Outcome } {
   const guard = guardStmt(db, job)
-  // Conséquence par défaut d'un échec définitif : une carte dont l'image échoue passe en
-  // `download_error` ; une carte venue de l'index dont le détail échoue voit quand même son image cherchée.
+  // Conséquence par défaut d'un échec définitif : une image (principale, petite image ou logo) qui
+  // échoue passe en `download_error` ; une carte venue de l'index dont le détail échoue voit quand
+  // même son image cherchée.
   const imageFailure = (reason: string): D1PreparedStatement[] => {
-    if (job.job_type === 'image' && job.card_id) {
-      return [imageFailureStmt(db, job.card_id, { status: 'download_error', reason, testedUrls: '[]', httpStatus: null }, nowMs)]
-    }
+    if (job.job_type === 'image') return imageJobFailureStmts(db, job, reason, nowMs)
     if (job.job_type === 'card' && job.language && job.target_id && jobPayload<{ orphan: boolean }>(job).orphan === true) {
       return enqueueStmts(db, 'image', job.language, [imageJob(job.language, job.target_id)], { runId: job.run_id, maxAttempts: config.maxAttempts, nowMs })
     }
@@ -435,10 +442,11 @@ async function flush(
         const final = job.attempts >= job.max_attempts
         const retryAt = nowMs + clampDelay(retryDelayMs(job.attempts, config.retryBaseMs, config.retryMaxMs, random))
         const reason = `écriture D1 échouée : ${message}`
-        if (final && job.job_type === 'image' && job.card_id) {
-          // Échec définitif d'une image : la carte passe en download_error (sinon, au moins la tâche).
+        const failure = final ? imageJobFailureStmts(db, job, reason, nowMs) : []
+        if (failure.length) {
+          // Échec définitif d'une image : sa cible passe en download_error (sinon, au moins la tâche).
           try {
-            await db.batch([guardStmt(db, job), imageFailureStmt(db, job.card_id, { status: 'download_error', reason, testedUrls: '[]', httpStatus: null }, nowMs), failStmt(db, job, nowMs, reason, null)])
+            await db.batch([guardStmt(db, job), ...failure, failStmt(db, job, nowMs, reason, null)])
             counters.failed++
             continue
           } catch {

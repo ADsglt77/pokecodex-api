@@ -12,7 +12,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { handleAdmin } from '../src/admin/router'
 import type { Language } from '../src/config'
 import { Db } from '../src/db'
-import { claimJobs, reclaimExpired } from '../src/repositories/jobs'
+import { claimJobs, JOB_KIND_SQL, reclaimExpired } from '../src/repositories/jobs'
 import { acquireRunnerLease } from '../src/repositories/state'
 import { finalizeSyncRuns, mapPool, runTick, type RunnerDeps, type TickResult } from '../src/services/runner'
 import { cancelSync, pauseSync, resumeSync, retryMissing, startSync } from '../src/services/sync'
@@ -122,20 +122,27 @@ async function weeklySync(deps: RunnerDeps, clock: Clock, days = 7): Promise<num
 /**
  * Amène la synchronisation FR au point où ses 4 tâches d'image et ses 4 tâches de détail sont prêtes :
  * une exécution limitée à 4 tâches traite le catalogue et les 2 extensions ; l'index des cartes est
- * rendu (il attend la fin des extensions).
+ * rendu (il attend la fin des extensions). Les extensions ont aussi créé, en dernière priorité, les
+ * copies secondaires (4 petites images, le logo de swsh3) : elles sont vérifiées puis retirées de la
+ * file, pour que ces tests de l'exécuteur portent sur les 8 tâches principales seules (les copies
+ * secondaires ont leurs propres tests : tests/media.test.ts).
  */
 async function prepareImageJobs(deps: RunnerDeps, clock: Clock): Promise<void> {
   await startSync(db(), deps.config, clock.now(), { languages: ['fr'] })
   const first = await tick(deps, { maxJobs: 4 })
   expect(first).toMatchObject({ status: 'ran', claimed: 4, done: 3, released: 1 })
-  const ready = await rows<{ job_type: string; n: number }>(
-    `SELECT job_type, COUNT(*) AS n FROM import_jobs WHERE status = 'pending' AND next_attempt_at <= ?1 GROUP BY job_type ORDER BY job_type`,
+  const ready = await rows<{ kind: string; n: number; priority: number }>(
+    `SELECT ${JOB_KIND_SQL} AS kind, COUNT(*) AS n, MIN(priority) AS priority FROM import_jobs
+     WHERE status = 'pending' AND next_attempt_at <= ?1 GROUP BY 1 ORDER BY 1`,
     iso(clock.now()),
   )
   expect(ready).toEqual([
-    { job_type: 'card', n: 4 },
-    { job_type: 'image', n: 4 },
+    { kind: 'card', n: 4, priority: 5 },
+    { kind: 'image', n: 4, priority: 4 },
+    { kind: 'image_low', n: 4, priority: 6 },
+    { kind: 'logo', n: 1, priority: 6 },
   ])
+  await env.DB.prepare(`DELETE FROM import_jobs WHERE priority = 6`).run()
 }
 
 /**
@@ -391,7 +398,10 @@ describe('reprise après interruption et verrous', () => {
     expect(await notDone()).toEqual([])
     const urls = fake.requests.map((request) => request.url)
     const images = urls.filter((url) => url.endsWith('.webp'))
-    expect(images).toHaveLength(7)
+    // 7 images principales, 4 petites images (cartes à image valide) et le logo de swsh3.
+    expect(images).toHaveLength(7 + 4 + 1)
+    expect(images.filter((url) => url.endsWith('/low.webp'))).toHaveLength(4)
+    expect(images.filter((url) => url.endsWith('/logo.webp'))).toEqual([`${ASSETS}/fr/swsh/swsh3/logo.webp`])
     expect(new Set(images).size).toBe(images.length)
     const api = urls.filter((url) => url.startsWith(`${API}/`))
     expect(new Set(api).size).toBe(api.length)
@@ -812,7 +822,14 @@ describe('budgets, plafonds et pause', () => {
     }
 
     const result = await tick(deps)
-    expect(result).toMatchObject({ status: 'ran', claimed: 12, httpRequests: 12 })
+    // 12 tâches principales, puis les 5 copies secondaires (petites images et logo de swsh3) : les
+    // petites images de 136 et 137, réservées dans le même lot que leur image principale en cours de
+    // copie, sont rendues (comme l'index des cartes qui attend les extensions) ; celles de 138 et
+    // exu-%3F n'ont rien à copier ; seul le logo fait une requête (404).
+    expect(result).toMatchObject({ status: 'ran', claimed: 12 + 5, httpRequests: 12 + 1, released: 1 + 2 })
+    for (const id of ['swsh3-136', 'swsh3-137']) {
+      expect(await job(`image_low:fr:${id}`), id).toMatchObject({ status: 'pending', releases: 1, last_error: 'petite image : image principale en cours de copie' })
+    }
     // Pendant le 2e lot : les 2 requêtes du catalogue ; pendant le 3e : celles des 2 extensions en plus.
     expect(seen).toEqual({ [`${API}/fr/sets/swsh3`]: 2, [URL_136]: 4 })
     // Fin d'exécution : requêtes TCGdex + écritures R2 (images 136 et 137), sans double comptage.
@@ -831,16 +848,21 @@ describe('budgets, plafonds et pause', () => {
     const [held] = await claimJobs(db(), { limit: 1, token: 'execution-morte', nowMs: clock.now(), leaseMs: 30 * DAY })
     expect(held).toMatchObject({ job_type: 'set', target_id: 'swsh3' })
 
-    // Deux rendus, sans consommer de tentative.
-    expect(await tick(deps)).toMatchObject({ status: 'ran', released: 1, retried: 0 })
+    // Deux rendus, sans consommer de tentative (dans cette exécution, la petite image de exu-%3F,
+    // réservée dans le même lot que son image principale en cours de copie : rendue une fois).
+    expect(await tick(deps)).toMatchObject({ status: 'ran', released: 2, retried: 0 })
+    expect(await job('image_low:fr:exu-%3F')).toMatchObject({ status: 'pending', attempts: 0, releases: 1, last_error: 'petite image : image principale en cours de copie' })
     expect(await job('card_index:fr:*')).toMatchObject({ status: 'pending', attempts: 0, releases: 1 })
+    // (La petite image de exu-%3F, de nouveau prête, se termine sans rien copier : son image
+    // principale a été cherchée en vain, elle n'est plus en cours.)
     await untilReady(clock, 'card_index:fr:*')
-    expect(await tick(deps)).toMatchObject({ status: 'ran', claimed: 1, released: 1, retried: 0 })
+    expect(await tick(deps)).toMatchObject({ status: 'ran', claimed: 2, done: 1, released: 1, retried: 0 })
     expect(await job('card_index:fr:*')).toMatchObject({ status: 'pending', attempts: 0, releases: 2, last_error: 'en attente de 1 extension(s)' })
+    expect(await job('image_low:fr:exu-%3F')).toMatchObject({ status: 'done', attempts: 1, releases: 1 })
 
     // Au-delà du plafond : le rendu devient une nouvelle tentative, qui consomme la tentative.
     await untilReady(clock, 'card_index:fr:*')
-    expect(await tick(deps)).toMatchObject({ status: 'ran', claimed: 1, released: 0, retried: 1 })
+    expect(await tick(deps)).toMatchObject({ status: 'ran', claimed: 1, done: 0, released: 0, retried: 1 })
     expect(await job('card_index:fr:*')).toMatchObject({ status: 'pending', attempts: 1, releases: 2, last_error: 'en attente de 1 extension(s) (rendue 2 fois)' })
 
     // Tentatives épuisées : échec définitif ; l'index des cartes n'a jamais été demandé.
@@ -852,7 +874,11 @@ describe('budgets, plafonds et pause', () => {
       last_error: 'en attente de 1 extension(s) (rendue 2 fois) (après 3 tentative(s))',
     })
     expect(fake.count((url) => url === `${API}/fr/cards`)).toBe(0)
-    expect(await one(`SELECT SUM(jobs_released) AS released, SUM(jobs_retried) AS retried, SUM(jobs_failed) AS failed FROM tick_runs`)).toEqual({ released: 2, retried: 2, failed: 1 })
+    // Rendus : les deux de l'index des cartes et celui de la petite image de exu-%3F.
+    expect(await one(`SELECT SUM(jobs_released) AS released, SUM(jobs_retried) AS retried, SUM(jobs_failed) AS failed FROM tick_runs`)).toEqual({ released: 3, retried: 2, failed: 1 })
+    // La petite image n'avait rien à copier (image principale introuvable) : terminée sans écriture.
+    expect(await job('image_low:fr:exu-%3F')).toMatchObject({ status: 'done', releases: 1 })
+    expect((await card('fr:exu-%3F')).image_status).toBe('not_found_on_cdn')
 
     // Synchronisation abandonnée puis relancée : la tâche repart avec ses compteurs à zéro.
     expect(await cancelSync(db(), clock.now(), ['fr'])).toEqual({ cancelled: 1 })
@@ -898,8 +924,13 @@ describe('budgets, plafonds et pause', () => {
     expect(ticks.at(-1)).toMatchObject({ status: 'skipped', reason: `en pause : ${reason}` })
     expect(await runtimeState()).toMatchObject({ paused: '1', pause_reason: reason })
 
-    // Le travail restant est conservé (index des cartes en attente), mais plus rien ne part.
-    expect(await notDone()).toEqual([{ dedupe_key: 'card_index:fr:*', status: 'pending' }])
+    // Le travail restant est conservé (index des cartes, petites images rendues car réservées dans le
+    // même lot que leur image principale), mais plus rien ne part.
+    expect(await notDone()).toEqual([
+      { dedupe_key: 'card_index:fr:*', status: 'pending' },
+      { dedupe_key: 'image_low:fr:swsh3-136', status: 'pending' },
+      { dedupe_key: 'image_low:fr:swsh3-137', status: 'pending' },
+    ])
     const requests = fake.requests.length
     clock.advance(DAY)
     expect(await tick(deps)).toMatchObject({ status: 'skipped', reason: `en pause : ${reason}` })

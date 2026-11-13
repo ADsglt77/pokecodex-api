@@ -77,6 +77,41 @@ export function imageCandidates(
   return qualities.slice(0, config.maxReconstructionUrls).map((quality) => ({ url: `${base}/${quality}.webp`, quality, source: 'cdn_reconstructed' }))
 }
 
+/**
+ * URL de la petite image d'une carte : la même base que l'image principale réellement copiée
+ * (`image_source_url`), en qualité `low`. `null` si cette URL est absente ou n'est pas une URL
+ * d'image fiable du CDN dans la langue de la carte (`…/high.webp` ou `…/low.webp`).
+ */
+export function lowImageUrl(sourceUrl: string | null, language: Language): string | null {
+  const match = sourceUrl ? /^(.+)\/(high|low)\.webp$/.exec(sourceUrl) : null
+  const base = match?.[1] ?? null
+  return isTrustedImageBase(base, language) ? `${base}/low.webp` : null
+}
+
+/** L'URL source d'une image principale est-elle déjà en qualité `low` ? */
+export const isLowQualitySource = (sourceUrl: string | null, quality: string | null): boolean =>
+  quality === 'low' || (sourceUrl ?? '').endsWith('/low.webp')
+
+/**
+ * URL du logo d'une extension : `<logo>.webp`, seulement en https sur le CDN de TCGdex, sans requête
+ * ni fragment, et dans la langue de l'extension ou dans `univ` (ressources communes) : un logo d'une
+ * autre langue n'est jamais copié. `null` sinon.
+ */
+export function logoImageUrl(logoUrl: string | null, language: Language): string | null {
+  if (!logoUrl || logoUrl.includes('?') || logoUrl.includes('#') || !logoUrl.startsWith(`${ASSETS_BASE}/`)) return null
+  // Un segment « . » ou « .. » (même écrit %2e) serait normalisé par fetch vers une autre ressource.
+  const segments = logoUrl.slice(ASSETS_BASE.length + 1).split('/')
+  if (segments.some((part) => ['', '.', '..'].includes(part.replace(/%2e/gi, '.')))) return null
+  if (segments[0] !== language && segments[0] !== 'univ') return null
+  try {
+    const url = new URL(logoUrl)
+    if (url.protocol !== 'https:' || url.host !== ASSETS_HOST || url.username || url.password) return null
+    return `${logoUrl}.webp`
+  } catch {
+    return null
+  }
+}
+
 export type WebpCheck =
   | { ok: true; sha256: string; md5: string }
   /** `transient` : transfert probablement corrompu (à retenter) ; sinon fichier invalide. */

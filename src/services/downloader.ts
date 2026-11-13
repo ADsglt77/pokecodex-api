@@ -18,7 +18,7 @@
 
 import { IMAGES_PREFIX } from '../config'
 import { imageFailureStmt, imageSuccessStmt, isValidImageStatus, type CardForJob, type ImageStatus } from '../repositories/catalog'
-import type { Job } from '../repositories/jobs'
+import { reviveLowImageStmt, type Job } from '../repositories/jobs'
 import { checkWebp, imageCandidates } from '../tcgdex/images'
 import { BodyTooLargeError, readCapped } from '../utils/http'
 import { cardImageKey } from '../utils/keys'
@@ -40,6 +40,8 @@ export async function runImageJob(ctx: JobContext, job: Job, card: CardForJob | 
   if (isValidImageStatus(card.image_status) && card.image_r2_key) return { kind: 'done', statements: [] }
 
   const key = cardImageKey(language, card.set_tcgdex_id ?? NO_SET, card.tcgdex_id)
+  /** La petite image de la carte, remise en file avec chaque réussite (`reviveLowImageStmt`). */
+  const lowImageAfter = () => [reviveLowImageStmt(db, language, card.tcgdex_id, ctx.now())]
   if (!key.startsWith(IMAGES_PREFIX)) throw new Error(`clé R2 hors du préfixe ${IMAGES_PREFIX} : ${key}`)
   const usage = db.usage
 
@@ -78,6 +80,7 @@ export async function runImageJob(ctx: JobContext, job: Job, card: CardForJob | 
           },
           ctx.now(),
         ),
+        ...lowImageAfter(),
       ],
     }
   }
@@ -192,6 +195,7 @@ export async function runImageJob(ctx: JobContext, job: Job, card: CardForJob | 
           },
           ctx.now(),
         ),
+        ...lowImageAfter(),
       ],
     }
   }

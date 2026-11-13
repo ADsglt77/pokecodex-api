@@ -17,6 +17,13 @@ export type ImageStatus = 'pending' | (typeof VALID_IMAGE_STATUSES)[number] | (t
 
 export const isValidImageStatus = (status: string): boolean => (VALID_IMAGE_STATUSES as readonly string[]).includes(status)
 
+/**
+ * Statuts des petites images et des logos (`image_low_status`, `logo_status`, NULL = jamais traité) :
+ * `downloaded` est le seul qui signifie « présent dans R2 » (contrat avec le site).
+ */
+export type MediaStatus = 'downloaded' | (typeof MISSING_IMAGE_STATUSES)[number] | (typeof ERROR_IMAGE_STATUSES)[number]
+export type MediaFailureStatus = Exclude<MediaStatus, 'downloaded'>
+
 /** Blocs de lignes pour `json_each` (chaque valeur liée reste loin de la limite de 2 Mo). */
 function chunks<T>(rows: T[], size = 400): T[][] {
   const out: T[][] = []
@@ -235,15 +242,28 @@ export interface ExistingCard {
   api_image_url: string | null
   series_id: string | null
   removed_at: string | null
+  image_low_status: MediaStatus | null
+  image_low_checked_at: string | null
 }
 
 export function existingCardsOfSet(db: Db, setInternalId: string): Promise<ExistingCard[]> {
   return db.all<ExistingCard>(
     `SELECT id, tcgdex_id, brief_hash, detail_status, detail_fetched_at, image_status, image_checked_at,
-       api_image_url, series_id, removed_at
+       api_image_url, series_id, removed_at, image_low_status, image_low_checked_at
      FROM cards WHERE set_id = ?1`,
     setInternalId,
   )
+}
+
+/** État du logo d'une extension (décision de la tâche `set`), ou `null` si l'extension est inconnue. */
+export interface SetLogoState {
+  logo_status: MediaStatus | null
+  logo_checked_at: string | null
+  logo_source_url: string | null
+}
+
+export function setLogoState(db: Db, setInternalId: string): Promise<SetLogoState | null> {
+  return db.first<SetLogoState>(`SELECT logo_status, logo_checked_at, logo_source_url FROM sets WHERE id = ?1`, setInternalId)
 }
 
 export interface CardDetailRow {
@@ -314,6 +334,12 @@ export interface CardForJob {
   image_r2_key: string | null
   image_checked_at: string | null
   detail_status: string
+  /** Image principale réellement copiée : URL, qualité, SHA-256 (base de la petite image). */
+  image_source_url: string | null
+  image_quality: string | null
+  image_sha256: string | null
+  image_low_status: MediaStatus | null
+  image_low_r2_key: string | null
 }
 
 /** Lit en une requête les cartes de plusieurs tâches. */
@@ -322,7 +348,8 @@ export async function cardsForJobs(db: Db, cardIds: string[]): Promise<Map<strin
   const rows = await db.all<CardForJob>(
     `SELECT c.id, c.tcgdex_id, c.language, c.name, c.local_id, c.set_id, s.tcgdex_id AS set_tcgdex_id,
        COALESCE(c.series_id, se.tcgdex_id) AS series_id, s.logo_url AS set_logo_url, s.symbol_url AS set_symbol_url,
-       c.api_image_url, c.image_status, c.image_r2_key, c.image_checked_at, c.detail_status
+       c.api_image_url, c.image_status, c.image_r2_key, c.image_checked_at, c.detail_status,
+       c.image_source_url, c.image_quality, c.image_sha256, c.image_low_status, c.image_low_r2_key
      FROM cards c
      LEFT JOIN sets s ON s.id = c.set_id
      LEFT JOIN series se ON se.id = s.series_id
@@ -384,6 +411,91 @@ export function imageFailureStmt(
     failure.reason,
     failure.testedUrls,
     failure.httpStatus,
+    iso(nowMs),
+  )
+}
+
+// ——— Petites images et logos ———
+
+/**
+ * Petite image copiée (ou déjà présente dans R2, ou image principale déjà en qualité `low`). `size`
+ * est NULL quand la petite image réutilise l'objet de l'image principale (octets déjà comptés).
+ */
+export function lowImageSuccessStmt(db: Db, cardId: string, image: { key: string; size: number | null; sha256: string | null }, nowMs: number): D1PreparedStatement {
+  return db.stmt(
+    `UPDATE cards SET image_low_status = 'downloaded', image_low_r2_key = ?2, image_low_file_size = ?3,
+       image_low_sha256 = ?4, image_low_checked_at = ?5, image_low_failure_reason = NULL, updated_at = ?5
+     WHERE id = ?1`,
+    cardId,
+    image.key,
+    image.size,
+    image.sha256,
+    iso(nowMs),
+  )
+}
+
+/** Échec d'une petite image, sans jamais effacer une petite image déjà copiée. */
+export function lowImageFailureStmt(db: Db, cardId: string, failure: { status: MediaFailureStatus; reason: string }, nowMs: number): D1PreparedStatement {
+  return db.stmt(
+    `UPDATE cards SET image_low_status = ?2, image_low_failure_reason = ?3, image_low_checked_at = ?4, updated_at = ?4
+     WHERE id = ?1 AND image_low_status IS NOT 'downloaded'`,
+    cardId,
+    failure.status,
+    failure.reason,
+    iso(nowMs),
+  )
+}
+
+/** Ce que la tâche de logo lit d'une extension. */
+export interface SetForLogoJob {
+  id: string
+  tcgdex_id: string
+  language: Language
+  logo_url: string | null
+  logo_status: MediaStatus | null
+  logo_r2_key: string | null
+}
+
+/** Lit en une requête les extensions de plusieurs tâches de logo. */
+export async function setsForLogoJobs(db: Db, setIds: string[]): Promise<Map<string, SetForLogoJob>> {
+  if (!setIds.length) return new Map()
+  const rows = await db.all<SetForLogoJob>(
+    `SELECT id, tcgdex_id, language, logo_url, logo_status, logo_r2_key
+     FROM sets WHERE id IN (SELECT value FROM json_each(?1))`,
+    JSON.stringify([...new Set(setIds)]),
+  )
+  return new Map(rows.map((row) => [row.id, row]))
+}
+
+export function logoSuccessStmt(db: Db, setId: string, logo: { key: string; sourceUrl: string | null; size: number; sha256: string | null }, nowMs: number): D1PreparedStatement {
+  return db.stmt(
+    `UPDATE sets SET logo_status = 'downloaded', logo_r2_key = ?2, logo_source_url = COALESCE(?3, logo_source_url),
+       logo_file_size = ?4, logo_sha256 = ?5, logo_checked_at = ?6, logo_failure_reason = NULL, updated_at = ?6
+     WHERE id = ?1`,
+    setId,
+    logo.key,
+    logo.sourceUrl,
+    logo.size,
+    logo.sha256,
+    iso(nowMs),
+  )
+}
+
+/** Échec d'un logo, sans jamais effacer un logo déjà copié. */
+export function logoFailureStmt(
+  db: Db,
+  setId: string,
+  failure: { status: MediaFailureStatus; reason: string; sourceUrl?: string | null },
+  nowMs: number,
+): D1PreparedStatement {
+  return db.stmt(
+    `UPDATE sets SET logo_status = ?2, logo_failure_reason = ?3, logo_source_url = COALESCE(?4, logo_source_url),
+       logo_checked_at = ?5, updated_at = ?5
+     WHERE id = ?1 AND logo_status IS NOT 'downloaded'`,
+    setId,
+    failure.status,
+    failure.reason,
+    failure.sourceUrl ?? null,
     iso(nowMs),
   )
 }

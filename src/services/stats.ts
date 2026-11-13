@@ -5,6 +5,7 @@
 
 import type { Config, Language } from '../config'
 import type { Db } from '../db'
+import { JOB_KIND_SQL } from '../repositories/jobs'
 import { backoffUntilMs, dailyOperations, isPaused, readState, STATE } from '../repositories/state'
 import { nextCronTime } from '../utils/cron'
 import { iso } from '../utils/time'
@@ -30,9 +31,24 @@ export interface LanguageStats {
   downloadErrors: number
   invalidImages: number
   errors: number
+  /** Octets des images principales valides. */
   bytes: number
   /** Couverture : images stockées / cartes répertoriées par TCGdex. */
   coveragePercent: number
+  /** Petites images (`low.webp`) copiées, introuvables, en erreur, et à faire (image principale valide, jamais traitée). */
+  lowImagesStored: number
+  lowImagesMissing: number
+  lowImagesErrors: number
+  lowImagesPending: number
+  /** Octets propres aux petites images (hors petites images qui réutilisent l'objet principal). */
+  lowBytes: number
+  /** Extensions dont l'API donne un logo ; logos copiés, introuvables, en erreur, à faire. */
+  setsWithLogo: number
+  logosStored: number
+  logosMissing: number
+  logosErrors: number
+  logosPending: number
+  logoBytes: number
 }
 
 export interface JobCount {
@@ -53,7 +69,14 @@ export interface Stats {
     imagesRecovered: number
     imagesMissing: number
     errors: number
+    /** Octets des images principales. */
     bytes: number
+    lowImagesStored: number
+    logosStored: number
+    /** Octets des petites images et des logos. */
+    mediaBytes: number
+    /** Volume total sous `cards/` (images principales, petites images, logos) : celui du plafond. */
+    storedBytes: number
     progressPercent: number
     jobsTotal: number
     jobsActive: number
@@ -91,7 +114,19 @@ async function languageStats(db: Db, language: Language): Promise<LanguageStats>
        COALESCE(SUM(removed_at IS NULL AND image_status = 'download_error'), 0) AS downloadErrors,
        COALESCE(SUM(removed_at IS NULL AND image_status = 'invalid_image'), 0) AS invalidImages,
        COALESCE(SUM(CASE WHEN image_status IN ('downloaded', 'recovered_from_cdn', 'already_present')
-         THEN image_file_size END), 0) AS bytes
+         THEN image_file_size END), 0) AS bytes,
+       COALESCE(SUM(removed_at IS NULL AND image_low_status = 'downloaded'), 0) AS lowImagesStored,
+       COALESCE(SUM(removed_at IS NULL AND image_low_status IN ('missing_api_url', 'not_found_on_cdn')), 0) AS lowImagesMissing,
+       COALESCE(SUM(removed_at IS NULL AND image_low_status IN ('download_error', 'invalid_image')), 0) AS lowImagesErrors,
+       COALESCE(SUM(removed_at IS NULL AND image_low_status IS NULL
+         AND image_status IN ('downloaded', 'recovered_from_cdn', 'already_present')), 0) AS lowImagesPending,
+       COALESCE(SUM(CASE WHEN image_low_status = 'downloaded' THEN image_low_file_size END), 0) AS lowBytes,
+       (SELECT COUNT(*) FROM sets WHERE language = ?1 AND logo_url IS NOT NULL) AS setsWithLogo,
+       (SELECT COUNT(*) FROM sets WHERE language = ?1 AND logo_status = 'downloaded') AS logosStored,
+       (SELECT COUNT(*) FROM sets WHERE language = ?1 AND logo_status IN ('missing_api_url', 'not_found_on_cdn')) AS logosMissing,
+       (SELECT COUNT(*) FROM sets WHERE language = ?1 AND logo_status IN ('download_error', 'invalid_image')) AS logosErrors,
+       (SELECT COUNT(*) FROM sets WHERE language = ?1 AND logo_url IS NOT NULL AND logo_status IS NULL) AS logosPending,
+       (SELECT COALESCE(SUM(logo_file_size), 0) FROM sets WHERE language = ?1 AND logo_status = 'downloaded') AS logoBytes
      FROM cards WHERE language = ?1`,
     language,
   )
@@ -109,7 +144,10 @@ async function languageStats(db: Db, language: Language): Promise<LanguageStats>
 
 export async function collectStats(db: Db, config: Config, nowMs: number): Promise<Stats> {
   const languages = await Promise.all(config.languages.map((language) => languageStats(db, language)))
-  const jobs = await db.all<JobCount>(`SELECT job_type, status, COUNT(*) AS n FROM import_jobs GROUP BY job_type, status ORDER BY job_type, status`)
+  // Petites images et logos (tâches `image`) comptés à part : `image_low`, `logo`.
+  const jobs = await db.all<JobCount>(
+    `SELECT ${JOB_KIND_SQL} AS job_type, status, COUNT(*) AS n FROM import_jobs GROUP BY 1, status ORDER BY 1, status`,
+  )
   const state = await readState(db, nowMs)
   const syncRuns = await db.all<Record<string, unknown>>(`SELECT * FROM sync_runs ORDER BY id DESC LIMIT 6`)
 
@@ -160,6 +198,10 @@ export async function collectStats(db: Db, config: Config, nowMs: number): Promi
       imagesMissing: sum('imagesMissing'),
       errors: sum('errors'),
       bytes: sum('bytes'),
+      lowImagesStored: sum('lowImagesStored'),
+      logosStored: sum('logosStored'),
+      mediaBytes: sum('lowBytes') + sum('logoBytes'),
+      storedBytes: sum('bytes') + sum('lowBytes') + sum('logoBytes'),
       progressPercent: percent(jobsFinished, jobsTotal),
       jobsTotal,
       jobsActive,
@@ -204,6 +246,8 @@ export function formatStatus(stats: Stats): string {
       `${pad('Images manquantes')}: ${n(lang.imagesMissing)}`,
       `${pad('Erreurs')}: ${n(lang.errors)}`,
       `${pad('En attente')}: ${n(lang.imagesPending)}`,
+      `${pad('Petites images (low)')}: ${n(lang.lowImagesStored)} / ${n(lang.imagesStored)} (introuvables ${n(lang.lowImagesMissing)}, erreurs ${n(lang.lowImagesErrors)}, à faire ${n(lang.lowImagesPending)})`,
+      `${pad('Logos d’extension')}: ${n(lang.logosStored)} / ${n(lang.setsWithLogo)} (introuvables ${n(lang.logosMissing)}, erreurs ${n(lang.logosErrors)}, à faire ${n(lang.logosPending)})`,
       '',
     )
   }
@@ -212,7 +256,9 @@ export function formatStatus(stats: Stats): string {
     'TOTAL',
     `${pad('Cartes traitées')}: ${n(stats.total.cardsProcessed)} / ${n(stats.total.cards)}`,
     `${pad('Images stockées R2')}: ${n(stats.total.imagesStored)}`,
-    `${pad('Volume stocké')}: ${gb(stats.total.bytes)} Go`,
+    `${pad('Petites images R2')}: ${n(stats.total.lowImagesStored)}`,
+    `${pad('Logos R2')}: ${n(stats.total.logosStored)}`,
+    `${pad('Volume stocké')}: ${gb(stats.total.storedBytes)} Go`,
     `${pad('Progression')}: ${stats.total.progressPercent.toLocaleString('fr-FR')} % (${n(stats.total.jobsTotal - stats.total.jobsActive)} / ${n(stats.total.jobsTotal)} tâches)`,
     `${pad('Dernière exécution')}: ${lastTick?.finishedAt ?? 'aucune'}${lastTick?.stopReason ? ` (${lastTick.stopReason})` : ''}`,
     `${pad('Dernière activité')}: ${stats.lastActiveTick ?? 'aucune'}`,

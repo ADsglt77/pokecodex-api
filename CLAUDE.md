@@ -63,10 +63,24 @@ convertirait `/admin/…` en chemin Windows).
   qui liste la carte prime sur celle de son détail).
 - **Idempotence** : `dedupe_key` unique par tâche ; upserts conditionnés par `*_hash` ; une image
   valide n'est jamais retéléchargée ni écrasée.
+- **Petites images et logos** (`src/services/media.ts`, migration `0002_media.sql`) : tâches `image`
+  de priorité 6 (`MEDIA_PRIORITY`, après tout le reste), charge utile `{"media":"low"|"logo"}`,
+  `dedupe_key` `image_low:<langue>:<carte>` / `logo:<langue>:<extension>` ; ne jamais ajouter de
+  type à `import_jobs.job_type` (CHECK : reconstruction de table interdite). Clés R2 :
+  `cards/<langue>/<ext>/<carte>.low.webp` (clé principale, `.webp` → `.low.webp` ; même clé si la
+  principale est déjà `low`) et `cards/<langue>/<ext>/_logo.webp`. Le site lit `image_low_status`,
+  `image_low_r2_key`, `logo_status`, `logo_r2_key` : `downloaded` est le seul statut « présent »
+  (CHECK). Créées par la tâche `set` et par `POST /admin/sync/backfill-media` ; revérifiées après
+  30 jours comme les images principales ; comptées dans `MAX_DAILY_OPERATIONS` et `MAX_STORED_BYTES`
+  (index couvrant `cards_low_stored`). Une petite image n'attend jamais son image principale (pas de
+  rendu tant qu'elle est en file : `MAX_RELEASES` serait usé) : sans image principale valide, tâche
+  `done` sans écriture ; la réussite de `runImageJob` la remet en attente (`reviveLowImageStmt`,
+  jamais de création). Seul rendu : même lot que l'image principale en cours de copie (même jeton).
 
 ## Fichiers clés
 
-`src/services/runner.ts` (exécuteur), `src/services/downloader.ts` (images), `src/services/catalog.ts`
-(catalogue, extensions, index), `src/services/cards.ts` (détails), `src/services/reports.ts` (audit et
-exports), `src/repositories/jobs.ts` (file de tâches), `migrations/0001_initial.sql` (schéma),
-`tests/helpers.ts` (faux TCGdex, horloge simulée).
+`src/services/runner.ts` (exécuteur), `src/services/downloader.ts` (images), `src/services/media.ts`
+(petites images et logos), `src/services/catalog.ts` (catalogue, extensions, index),
+`src/services/cards.ts` (détails), `src/services/reports.ts` (audit et exports),
+`src/repositories/jobs.ts` (file de tâches), `migrations/` (schéma : `0001_initial.sql`,
+`0002_media.sql`), `tests/helpers.ts` (faux TCGdex, horloge simulée), `tests/media.test.ts`.

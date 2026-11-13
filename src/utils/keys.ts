@@ -22,5 +22,22 @@ export function encodeKeySegment(value: string): string {
 export const cardImageKey = (language: Language, setTcgdexId: string, cardTcgdexId: string): string =>
   `cards/${language}/${encodeKeySegment(setTcgdexId)}/${encodeKeySegment(cardTcgdexId)}.webp`
 
+/**
+ * Clé R2 de la petite image d'une carte : celle de son image principale, `.webp` remplacé par
+ * `.low.webp` (`cards/fr/swsh3/swsh3-136.webp` → `cards/fr/swsh3/swsh3-136.low.webp`) ; `null` si la
+ * clé principale n'est pas une clé d'image de l'importateur.
+ */
+export function lowImageKey(mainKey: string): string | null {
+  if (!mainKey.startsWith('cards/') || !mainKey.endsWith('.webp') || mainKey.length <= 'cards/.webp'.length) return null
+  return `${mainKey.slice(0, -'.webp'.length)}.low.webp`
+}
+
+/**
+ * Clé R2 du logo d'une extension : `cards/<langue>/<extension>/_logo.webp`. Le segment `_logo` ne
+ * peut pas venir d'une carte : `encodeKeySegment` n'écrit jamais `_` que suivi de deux chiffres
+ * hexadécimaux majuscules (`l` n'en est pas un).
+ */
+export const setLogoKey = (language: Language, setTcgdexId: string): string => `cards/${language}/${encodeKeySegment(setTcgdexId)}/_logo.webp`
+
 /** Identifiant interne d'une ligne : `<langue>:<id TCGdex>`. */
 export const internalId = (language: Language, tcgdexId: string): string => `${language}:${tcgdexId}`

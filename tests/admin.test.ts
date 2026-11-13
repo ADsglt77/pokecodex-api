@@ -196,6 +196,7 @@ const ROUTES: [string, string][] = [
   ['POST', '/admin/sync/resume'],
   ['POST', '/admin/sync/cancel'],
   ['POST', '/admin/sync/retry-missing'],
+  ['POST', '/admin/sync/backfill-media'],
   ['POST', '/admin/reports/generate'],
   ['POST', '/admin/tick'],
   ['POST', '/admin/selftest'],
@@ -307,6 +308,7 @@ describe('protection de l’API d’administration', () => {
       ['POST', '/admin/sync/resume'],
       ['POST', '/admin/sync/cancel'],
       ['POST', '/admin/sync/retry-missing'],
+      ['POST', '/admin/sync/backfill-media'],
       ['POST', '/admin/reports/generate'],
       ['POST', '/admin/sync/start'],
     ] as const) {
@@ -863,7 +865,10 @@ describe('commandes de synchronisation', () => {
     ctx.clock.advance(60_000)
     const result = await body<{ images: number; failedJobs: number }>(await direct(ctx, 'POST', '/admin/sync/retry-missing'))
     expect(result).toEqual({ images: 3, failedJobs: 1 })
-    const imageJobs = await rows<{ target_id: string; status: string }>(`SELECT target_id, status FROM import_jobs WHERE job_type = 'image' ORDER BY language, target_id`)
+    // Images principales seulement (les petites images et logos, aussi de type `image`, ont leur propre clé).
+    const imageJobs = await rows<{ target_id: string; status: string }>(
+      `SELECT target_id, status FROM import_jobs WHERE job_type = 'image' AND dedupe_key LIKE 'image:%' ORDER BY language, target_id`,
+    )
     expect(imageJobs).toEqual([
       { target_id: 'exu-%3F', status: 'pending' },
       { target_id: 'swsh3-136', status: 'done' },
@@ -1033,7 +1038,18 @@ describe('rapports', () => {
     expect(summary.languages[1]).toMatchObject({ cards: 3, imagesStored: 2, imagesMissing: 1, setsWithCards: 2 })
     expect(summary.total).toMatchObject({ cards: 7, imagesStored: 4, imagesMissing: 3, bytes: 1260, errors: 0 })
     expect(summary.sets).toHaveLength(4)
-    expect(summary.audit).toEqual({ r2Objects: 4, r2Bytes: 1260, unknownObjects: 0, reconciled: 0, missingObjects: 0 })
+    // Petites images et logo de swsh3 absents du faux CDN (404) : aucun objet secondaire.
+    expect(summary.audit).toEqual({
+      r2Objects: 4,
+      r2Bytes: 1260,
+      unknownObjects: 0,
+      reconciled: 0,
+      missingObjects: 0,
+      lowImageObjects: 0,
+      logoObjects: 0,
+      mediaReconciled: 0,
+      mediaMissingObjects: 0,
+    })
     expect(summary.syncRuns).toHaveLength(2)
 
     const csv = csvObjects(await r2Text('reports/latest/summary.csv'))
@@ -1290,7 +1306,7 @@ describe('GET /admin/r2 : métadonnées des objets sous cards/ et reports/', () 
 // ——— Audit D1 ↔ R2 ———
 
 describe('audit D1 ↔ R2 (tâche report)', () => {
-  it('objet présent dans R2 pour une carte pending → tâche d’image, puis already_present sans téléchargement', async () => {
+  it('objet présent dans R2 pour une carte pending → tâche d’image, puis already_present sans téléchargement ; sa petite image est remise en file', async () => {
     const ctx = setup(sampleCatalog(), { MIN_REQUEST_INTERVAL_MS: '50' })
     await importSample(ctx)
     const key = 'cards/fr/swsh3/swsh3-138.webp'
@@ -1308,8 +1324,13 @@ describe('audit D1 ↔ R2 (tâche report)', () => {
     const audit = (JSON.parse(await r2Text('reports/latest/summary.json')) as { audit: Record<string, number> }).audit
     expect(audit).toMatchObject({ r2Objects: 5, reconciled: 1, unknownObjects: 0, missingObjects: 0 })
 
+    // La petite image de 138, terminée sans rien copier à l'import (image principale introuvable).
+    const lowJob = `SELECT status FROM import_jobs WHERE dedupe_key = 'image_low:fr:swsh3-138'`
+    expect(await one(lowJob)).toEqual({ status: 'done' })
+
+    // Réconciliation de l'image principale, qui remet sa petite image en file : traitée dans la foulée.
     const imageTick = await body<TickResult>(await direct(ctx, 'POST', '/admin/tick'))
-    expect(imageTick).toMatchObject({ claimed: 1, done: 1, httpRequests: 0 })
+    expect(imageTick).toMatchObject({ claimed: 2, done: 2, httpRequests: 1 })
     expect(await one(`SELECT image_status, image_r2_key, image_file_size, image_sha256, image_source FROM cards WHERE id = 'fr:swsh3-138'`)).toEqual({
       image_status: 'already_present',
       image_r2_key: key,
@@ -1317,12 +1338,15 @@ describe('audit D1 ↔ R2 (tâche report)', () => {
       image_sha256: sha256,
       image_source: 'cdn_reconstructed',
     })
-    // Aucun téléchargement : l'objet existant est conservé tel quel.
-    expect(ctx.fake.requests.length).toBe(requestsBefore)
+    // Aucun téléchargement de l'image principale : l'objet existant est conservé tel quel. Seule
+    // requête : la petite image (absente du CDN simulé).
+    expect(ctx.fake.requests.slice(requestsBefore).map((request) => request.url)).toEqual([`${ASSETS}/fr/swsh/swsh3/138/low.webp`])
     expect(new Uint8Array(await ((await env.BUCKET.get(key)) as R2ObjectBody).arrayBuffer())).toEqual(bytes)
+    expect(await one(lowJob)).toEqual({ status: 'done' })
+    expect(await one(`SELECT image_low_status FROM cards WHERE id = 'fr:swsh3-138'`)).toEqual({ image_low_status: 'not_found_on_cdn' })
   })
 
-  it('carte downloaded dont l’objet a disparu de R2 → remise pending, puis recopiée', async () => {
+  it('carte downloaded dont l’objet a disparu de R2 → remise pending, puis recopiée ; sa petite image est remise en file', async () => {
     const ctx = setup(sampleCatalog(), { MIN_REQUEST_INTERVAL_MS: '50' })
     await importSample(ctx)
     const key = 'cards/fr/swsh3/swsh3-136.webp'
@@ -1336,11 +1360,14 @@ describe('audit D1 ↔ R2 (tâche report)', () => {
     const audit = (JSON.parse(await r2Text('reports/latest/summary.json')) as { audit: Record<string, number> }).audit
     expect(audit).toMatchObject({ r2Objects: 3, missingObjects: 1, reconciled: 0 })
 
-    const downloads = ctx.fake.count((url) => url === `${ASSETS}/fr/swsh/swsh3/136/high.webp`)
+    // Image principale recopiée ; sa copie remet la petite image en file, traitée dans la foulée
+    // (absente du CDN simulé : de nouveau cherchée, une seule fois).
+    const requestsBefore = ctx.fake.requests.length
     const tick = await body<TickResult>(await direct(ctx, 'POST', '/admin/tick'))
-    expect(tick).toMatchObject({ claimed: 1, done: 1, httpRequests: 1 })
-    expect(ctx.fake.count((url) => url === `${ASSETS}/fr/swsh/swsh3/136/high.webp`)).toBe(downloads + 1)
-    expect(await one(`SELECT image_status FROM cards WHERE id = 'fr:swsh3-136'`)).toEqual({ image_status: 'downloaded' })
+    expect(tick).toMatchObject({ claimed: 2, done: 2, httpRequests: 2 })
+    expect(ctx.fake.requests.slice(requestsBefore).map((request) => request.url)).toEqual([`${ASSETS}/fr/swsh/swsh3/136/high.webp`, `${ASSETS}/fr/swsh/swsh3/136/low.webp`])
+    expect(await one(`SELECT image_status, image_low_status FROM cards WHERE id = 'fr:swsh3-136'`)).toEqual({ image_status: 'downloaded', image_low_status: 'not_found_on_cdn' })
+    expect(await one(`SELECT status FROM import_jobs WHERE dedupe_key = 'image_low:fr:swsh3-136'`)).toEqual({ status: 'done' })
     expect(new Uint8Array(await ((await env.BUCKET.get(key)) as R2ObjectBody).arrayBuffer())).toEqual(webp(300, 1))
   })
 

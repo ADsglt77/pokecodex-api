@@ -17,11 +17,11 @@
 import { IMAGES_PREFIX, REPORTS_PREFIX, type Config, type Language } from '../config'
 import type { Db } from '../db'
 import { isValidImageStatus } from '../repositories/catalog'
-import { enqueueStmts, guardStmt, type Job } from '../repositories/jobs'
+import { enqueueMediaStmts, enqueueStmts, guardStmt, JOB_KIND_SQL, type Job } from '../repositories/jobs'
 import { csvRow } from '../utils/csv'
-import { cardImageKey } from '../utils/keys'
+import { cardImageKey, lowImageKey, setLogoKey } from '../utils/keys'
 import { iso } from '../utils/time'
-import { imageJob } from './catalog'
+import { imageJob, logoJob, lowImageJob } from './catalog'
 import type { JobContext, JobResult } from './context'
 import { collectStats } from './stats'
 
@@ -113,7 +113,7 @@ export interface FailedJob {
 
 export function failedJobs(db: Db, opts: { afterId?: number; limit: number }): Promise<FailedJob[]> {
   return db.all<FailedJob>(
-    `SELECT id, job_type, language, target_id, attempts, last_error, last_http_status, updated_at
+    `SELECT id, ${JOB_KIND_SQL} AS job_type, language, target_id, attempts, last_error, last_http_status, updated_at
      FROM import_jobs WHERE status = 'failed' AND id > ?1 ORDER BY id LIMIT ?2`,
     opts.afterId ?? 0,
     opts.limit,
@@ -175,23 +175,59 @@ interface AuditResult {
   unknownObjects: number
   reconciled: number
   missingObjects: number
+  /** Objets de petites images et de logos trouvés sous `cards/`. */
+  lowImageObjects: number
+  logoObjects: number
+  /** Petites images ou logos présents dans R2 mais pas encore enregistrés : tâche de réconciliation. */
+  mediaReconciled: number
+  /** Petites images ou logos enregistrés dont l'objet manque : remis à zéro et recopiés. */
+  mediaMissingObjects: number
   statements: D1PreparedStatement[]
 }
 
-/** Compare les objets R2 sous `cards/` aux cartes de D1. */
+type AuditCard = {
+  id: string
+  tcgdex_id: string
+  language: Language
+  set_tcgdex_id: string | null
+  image_status: string
+  image_r2_key: string | null
+  image_low_status: string | null
+  image_low_r2_key: string | null
+}
+type AuditSet = { id: string; tcgdex_id: string; language: Language; logo_url: string | null; logo_status: string | null; logo_r2_key: string | null }
+type AuditTarget = { kind: 'main'; card: AuditCard } | { kind: 'low'; card: AuditCard } | { kind: 'logo'; set: AuditSet }
+
+/**
+ * Compare les objets R2 sous `cards/` aux cartes et extensions de D1 : images principales, petites
+ * images (`.low.webp`) et logos (`_logo.webp`).
+ */
 async function auditR2(ctx: JobContext, config: Config): Promise<AuditResult> {
   const { db, bucket } = ctx
-  const cards = await db.all<{ id: string; tcgdex_id: string; language: Language; set_tcgdex_id: string | null; image_status: string; image_r2_key: string | null }>(
-    `SELECT c.id, c.tcgdex_id, c.language, s.tcgdex_id AS set_tcgdex_id, c.image_status, c.image_r2_key
+  const cards = await db.all<AuditCard>(
+    `SELECT c.id, c.tcgdex_id, c.language, s.tcgdex_id AS set_tcgdex_id, c.image_status, c.image_r2_key,
+       c.image_low_status, c.image_low_r2_key
      FROM cards c LEFT JOIN sets s ON s.id = c.set_id`,
   )
-  const byKey = new Map<string, (typeof cards)[number]>()
-  for (const card of cards) byKey.set(card.image_r2_key ?? cardImageKey(card.language, card.set_tcgdex_id ?? 'sans-extension', card.tcgdex_id), card)
+  const sets = await db.all<AuditSet>(`SELECT id, tcgdex_id, language, logo_url, logo_status, logo_r2_key FROM sets`)
+  const byKey = new Map<string, AuditTarget>()
+  for (const card of cards) {
+    const mainKey = card.image_r2_key ?? cardImageKey(card.language, card.set_tcgdex_id ?? 'sans-extension', card.tcgdex_id)
+    byKey.set(mainKey, { kind: 'main', card })
+    // Une petite image qui réutilise l'objet principal n'a pas d'objet propre.
+    const lowKey = card.image_low_r2_key ?? lowImageKey(mainKey)
+    if (lowKey && lowKey !== mainKey) byKey.set(lowKey, { kind: 'low', card })
+  }
+  for (const set of sets) byKey.set(set.logo_r2_key ?? setLogoKey(set.language, set.tcgdex_id), { kind: 'logo', set })
 
   const seen = new Set<string>()
   let r2Bytes = 0
   let unknownObjects = 0
+  let lowImageObjects = 0
+  let logoObjects = 0
   const toReconcile: { language: Language; tcgdexId: string }[] = []
+  const lowToReconcile: AuditCard[] = []
+  const logosToReconcile: AuditSet[] = []
   let cursor: string | undefined
   do {
     db.usage.r2Reads++
@@ -199,16 +235,48 @@ async function auditR2(ctx: JobContext, config: Config): Promise<AuditResult> {
     for (const object of listed.objects) {
       seen.add(object.key)
       r2Bytes += object.size
-      const card = byKey.get(object.key)
-      if (!card) unknownObjects++
-      else if (!isValidImageStatus(card.image_status)) toReconcile.push({ language: card.language, tcgdexId: card.tcgdex_id })
+      const target = byKey.get(object.key)
+      if (!target) unknownObjects++
+      else if (target.kind === 'main') {
+        if (!isValidImageStatus(target.card.image_status)) toReconcile.push({ language: target.card.language, tcgdexId: target.card.tcgdex_id })
+      } else if (target.kind === 'low') {
+        lowImageObjects++
+        if (target.card.image_low_status !== 'downloaded' && isValidImageStatus(target.card.image_status)) lowToReconcile.push(target.card)
+      } else {
+        logoObjects++
+        if (target.set.logo_status !== 'downloaded') logosToReconcile.push(target.set)
+      }
     }
     cursor = listed.truncated ? listed.cursor : undefined
   } while (cursor)
 
   const missing = cards.filter((card) => isValidImageStatus(card.image_status) && card.image_r2_key && !seen.has(card.image_r2_key))
+  const missingLow = cards.filter((card) => card.image_low_status === 'downloaded' && card.image_low_r2_key && !seen.has(card.image_low_r2_key))
+  const missingLogos = sets.filter((set) => set.logo_status === 'downloaded' && set.logo_r2_key && !seen.has(set.logo_r2_key))
   const nowMs = ctx.now()
   const statements: D1PreparedStatement[] = []
+  if (missingLow.length) {
+    statements.push(
+      db.stmt(
+        `UPDATE cards SET image_low_status = NULL, image_low_r2_key = NULL, image_low_file_size = NULL, image_low_sha256 = NULL,
+           image_low_checked_at = NULL, image_low_failure_reason = 'objet absent de R2 (audit)', updated_at = ?1
+         WHERE id IN (SELECT value FROM json_each(?2))`,
+        iso(nowMs),
+        JSON.stringify(missingLow.map((card) => card.id)),
+      ),
+    )
+  }
+  if (missingLogos.length) {
+    statements.push(
+      db.stmt(
+        `UPDATE sets SET logo_status = NULL, logo_r2_key = NULL, logo_file_size = NULL, logo_sha256 = NULL,
+           logo_checked_at = NULL, logo_failure_reason = 'objet absent de R2 (audit)', updated_at = ?1
+         WHERE id IN (SELECT value FROM json_each(?2))`,
+        iso(nowMs),
+        JSON.stringify(missingLogos.map((set) => set.id)),
+      ),
+    )
+  }
   if (missing.length) {
     statements.push(
       db.stmt(
@@ -227,8 +295,25 @@ async function auditR2(ctx: JobContext, config: Config): Promise<AuditResult> {
       ...missing.filter((card) => card.language === language).map((card) => imageJob(language, card.tcgdex_id)),
     ]
     statements.push(...enqueueStmts(db, 'image', language, jobs, { runId: null, maxAttempts: config.maxAttempts, nowMs }))
+    // Petites images et logos : réconciliés (objet déjà là) ou recopiés (objet disparu) par leur tâche.
+    const media = [
+      ...[...lowToReconcile, ...missingLow].filter((card) => card.language === language).map((card) => lowImageJob(language, card.tcgdex_id)),
+      ...[...logosToReconcile, ...missingLogos].filter((set) => set.language === language && set.logo_url).map((set) => logoJob(language, set.tcgdex_id)),
+    ]
+    statements.push(...enqueueMediaStmts(db, language, media, { runId: null, maxAttempts: config.maxAttempts, nowMs }))
   }
-  return { r2Objects: seen.size, r2Bytes, unknownObjects, reconciled: toReconcile.length, missingObjects: missing.length, statements }
+  return {
+    r2Objects: seen.size,
+    r2Bytes,
+    unknownObjects,
+    reconciled: toReconcile.length,
+    missingObjects: missing.length,
+    lowImageObjects,
+    logoObjects,
+    mediaReconciled: lowToReconcile.length + logosToReconcile.length,
+    mediaMissingObjects: missingLow.length + missingLogos.length,
+    statements,
+  }
 }
 
 async function putReport(bucket: R2Bucket, key: string, body: string, contentType: string, ctx: JobContext): Promise<void> {
@@ -257,7 +342,17 @@ export async function runReportJob(ctx: JobContext, job: Job): Promise<JobResult
       setsWithCards: sets.filter((set) => set.language === lang.language).length,
     })),
     total: stats.total,
-    audit: { r2Objects: audit.r2Objects, r2Bytes: audit.r2Bytes, unknownObjects: audit.unknownObjects, reconciled: audit.reconciled, missingObjects: audit.missingObjects },
+    audit: {
+      r2Objects: audit.r2Objects,
+      r2Bytes: audit.r2Bytes,
+      unknownObjects: audit.unknownObjects,
+      reconciled: audit.reconciled,
+      missingObjects: audit.missingObjects,
+      lowImageObjects: audit.lowImageObjects,
+      logoObjects: audit.logoObjects,
+      mediaReconciled: audit.mediaReconciled,
+      mediaMissingObjects: audit.mediaMissingObjects,
+    },
     syncRuns: stats.syncRuns,
     sets,
   }

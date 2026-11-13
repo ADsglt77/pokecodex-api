@@ -1,16 +1,17 @@
 /**
  * Commandes de synchronisation : démarrer (initiale, hebdomadaire ou manuelle), mettre en pause,
- * reprendre, abandonner, relancer les images manquantes et les tâches en échec.
+ * reprendre, abandonner, relancer les images manquantes et les tâches en échec, rattraper les petites
+ * images et logos manquants.
  */
 
 import type { Config, Language } from '../config'
 import type { Db } from '../db'
 import { ERROR_IMAGE_STATUSES, MISSING_IMAGE_STATUSES } from '../repositories/catalog'
-import { dedupeKey, enqueueStmts, JOB_PRIORITY } from '../repositories/jobs'
+import { dedupeKey, enqueueMediaStmts, enqueueStmts, JOB_PRIORITY } from '../repositories/jobs'
 import { cancelSyncRunsStmt, createSyncRunStmt, hasCompletedRun, runningSyncRuns, type SyncKind } from '../repositories/runs'
 import { readState, setStateStmt, STATE } from '../repositories/state'
 import { iso } from '../utils/time'
-import { imageJob, type SyncScope } from './catalog'
+import { imageJob, logoJob, lowImageJob, type SyncScope } from './catalog'
 
 /** Une synchronisation encore « en cours » après ce délai est jugée bloquée et abandonnée. */
 const STALE_RUN_MS = 6 * 86_400_000
@@ -151,4 +152,79 @@ export async function retryMissing(db: Db, config: Config, nowMs: number, langua
   const results = await db.batch(statements)
   const failedJobs = results[0]?.meta.changes ?? 0
   return { images, failedJobs }
+}
+
+/** Taille d'une page de rattrapage (lignes lues puis tâches créées, en une requête chacune). */
+const BACKFILL_PAGE = 500
+/** Pages au plus par appel : ≤ 2 requêtes D1 par page, loin des 1 000 requêtes d'une invocation. */
+const BACKFILL_MAX_PAGES = 200
+
+export interface BackfillResult {
+  /** Tâches de petite image créées ou remises en attente. */
+  lowImages: number
+  /** Tâches de logo créées ou remises en attente. */
+  logos: number
+  /** Faux si le plafond de pages a été atteint : rappeler la route pour la suite. */
+  complete: boolean
+}
+
+/**
+ * Rattrapage des copies secondaires (`POST /admin/sync/backfill-media`) : une tâche de petite image
+ * pour chaque carte encore listée dont l'image principale est valide et la petite image pas encore
+ * copiée (jamais traitée, ou absente / en erreur depuis plus de `missingRecheckDays` jours), et une
+ * tâche de logo pour chaque extension dont l'API donne un logo pas encore copié (même règle, ou URL
+ * changée). Les cibles qui ont déjà une tâche active sont ignorées : rappeler la route ne crée rien
+ * de plus. Lecture par pages (pagination par identifiant), écriture par `json_each` (un paramètre).
+ */
+export async function backfillMedia(db: Db, config: Config, nowMs: number, languages: Language[]): Promise<BackfillResult> {
+  const cutoff = iso(nowMs - config.missingRecheckDays * 86_400_000)
+  const result: BackfillResult = { lowImages: 0, logos: 0, complete: true }
+  let pages = 0
+  const opts = { runId: null, maxAttempts: config.maxAttempts, nowMs }
+  for (const language of languages) {
+    for (const kind of ['low', 'logo'] as const) {
+      for (let after = ''; ; ) {
+        if (pages >= BACKFILL_MAX_PAGES) return { ...result, complete: false }
+        pages++
+        const rows =
+          kind === 'low'
+            ? await db.all<{ id: string; tcgdex_id: string }>(
+                `SELECT c.id, c.tcgdex_id FROM cards c
+                 WHERE c.language = ?1 AND c.id > ?2 AND c.removed_at IS NULL
+                   AND c.image_status IN ('downloaded', 'recovered_from_cdn', 'already_present') AND c.image_r2_key IS NOT NULL
+                   AND (c.image_low_status IS NULL OR (c.image_low_status != 'downloaded'
+                     AND (c.image_low_checked_at IS NULL OR c.image_low_checked_at < ?3)))
+                   AND NOT EXISTS (SELECT 1 FROM import_jobs j WHERE j.dedupe_key = 'image_low:' || c.language || ':' || c.tcgdex_id
+                     AND j.status IN ('pending', 'running'))
+                 ORDER BY c.id LIMIT ?4`,
+                language,
+                after,
+                cutoff,
+                BACKFILL_PAGE,
+              )
+            : await db.all<{ id: string; tcgdex_id: string }>(
+                `SELECT s.id, s.tcgdex_id FROM sets s
+                 WHERE s.language = ?1 AND s.id > ?2 AND s.logo_url IS NOT NULL
+                   AND (s.logo_status IS NULL OR (s.logo_status != 'downloaded'
+                     AND (s.logo_checked_at IS NULL OR s.logo_checked_at < ?3 OR s.logo_source_url IS NOT s.logo_url || '.webp')))
+                   AND NOT EXISTS (SELECT 1 FROM import_jobs j WHERE j.dedupe_key = 'logo:' || s.language || ':' || s.tcgdex_id
+                     AND j.status IN ('pending', 'running'))
+                 ORDER BY s.id LIMIT ?4`,
+                language,
+                after,
+                cutoff,
+                BACKFILL_PAGE,
+              )
+        if (rows.length) {
+          const jobs = rows.map((row) => (kind === 'low' ? lowImageJob(language, row.tcgdex_id) : logoJob(language, row.tcgdex_id)))
+          await db.batch(enqueueMediaStmts(db, language, jobs, opts))
+          if (kind === 'low') result.lowImages += rows.length
+          else result.logos += rows.length
+        }
+        if (rows.length < BACKFILL_PAGE) break
+        after = (rows[rows.length - 1] as { id: string }).id
+      }
+    }
+  }
+  return result
 }

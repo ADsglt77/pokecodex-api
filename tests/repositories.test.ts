@@ -283,6 +283,7 @@ describe('schéma D1 (migrations)', () => {
       ['cards_set', 'cards'],
       ['cards_language_status', 'cards'],
       ['cards_stored', 'cards'],
+      ['cards_low_stored', 'cards'],
       ['sync_runs_status', 'sync_runs'],
       ['sync_runs_one_running', 'sync_runs'],
       ['import_jobs_ready', 'import_jobs'],

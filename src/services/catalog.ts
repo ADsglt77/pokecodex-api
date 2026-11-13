@@ -12,13 +12,15 @@ import {
   insertSetBriefsStmts,
   isValidImageStatus,
   markRemovedStmt,
+  setLogoState,
   upsertCardBriefsStmts,
   upsertSeriesStmts,
   upsertSetDetailStmt,
   type CardBriefRow,
   type ExistingCard,
+  type SetLogoState,
 } from '../repositories/catalog'
-import { dedupeKey, enqueueStmts, type Job, type NewJob } from '../repositories/jobs'
+import { dedupeKey, enqueueMediaStmts, enqueueStmts, logoDedupeKey, lowImageDedupeKey, type Job, type NewJob } from '../repositories/jobs'
 import { updateSyncRunFoundStmt } from '../repositories/runs'
 import { seriesFromAssetUrl } from '../tcgdex/images'
 import { parseCardList, parseSeriesList, parseSetDetail, parseSetList, stripPricing, type CardBrief } from '../tcgdex/types'
@@ -51,6 +53,22 @@ export const setJob = (language: Language, setTcgdexId: string): NewJob => ({
   target: setTcgdexId,
   cardId: null,
   dedupeKey: dedupeKey('set', language, setTcgdexId),
+})
+
+/** Copie de la petite image (`low.webp`) d'une carte : tâche `image` de priorité `MEDIA_PRIORITY`. */
+export const lowImageJob = (language: Language, cardTcgdexId: string): NewJob => ({
+  target: cardTcgdexId,
+  cardId: internalId(language, cardTcgdexId),
+  dedupeKey: lowImageDedupeKey(language, cardTcgdexId),
+  payload: { media: 'low' },
+})
+
+/** Copie du logo d'une extension : tâche `image` de priorité `MEDIA_PRIORITY`. */
+export const logoJob = (language: Language, setTcgdexId: string): NewJob => ({
+  target: setTcgdexId,
+  cardId: null,
+  dedupeKey: logoDedupeKey(language, setTcgdexId),
+  payload: { media: 'logo' },
 })
 
 /** Tâche `catalog` : séries et extensions d'une langue, puis une tâche `set` par extension. */
@@ -125,9 +143,37 @@ function needsImage(card: ExistingCard, imageChanged: boolean, nowMs: number, re
 }
 
 /**
+ * Faut-il (re)copier la petite image de cette carte ? Seulement si son image principale est valide
+ * ou cherchée par cette même tâche (la petite image attend alors la principale), et si la petite
+ * image n'est pas déjà copiée : jamais traitée, ou absente / en erreur depuis plus de
+ * `recheckDays` jours (même règle que l'image principale).
+ */
+export function needsLowImage(card: ExistingCard | undefined, mainQueued: boolean, nowMs: number, recheckDays: number): boolean {
+  if (!card) return mainQueued
+  if (card.image_low_status === 'downloaded') return false
+  if (!isValidImageStatus(card.image_status) && !mainQueued) return false
+  if (card.image_low_status === null || !card.image_low_checked_at) return true
+  return nowMs - Date.parse(card.image_low_checked_at) > recheckDays * DAY_MS
+}
+
+/**
+ * Faut-il (re)copier le logo de cette extension ? Si l'API en donne un et qu'il n'est pas déjà
+ * copié : jamais traité, URL changée depuis la dernière vérification, ou absent / en erreur depuis
+ * plus de `recheckDays` jours. Un logo copié n'est jamais remplacé.
+ */
+export function needsLogo(state: SetLogoState | null, logoUrl: string | null, nowMs: number, recheckDays: number): boolean {
+  if (!logoUrl) return false
+  if (!state || state.logo_status === null) return true
+  if (state.logo_status === 'downloaded') return false
+  if (state.logo_source_url !== `${logoUrl}.webp` || !state.logo_checked_at) return true
+  return nowMs - Date.parse(state.logo_checked_at) > recheckDays * DAY_MS
+}
+
+/**
  * Tâche `set` : détail d'une extension et liste de ses cartes. Crée ou met à jour les cartes, puis
  * les tâches nécessaires : image pour toute carte sans image valide, détail pour toute carte
- * nouvelle, modifiée ou dont le détail a plus de `detailRefreshDays` jours.
+ * nouvelle, modifiée ou dont le détail a plus de `detailRefreshDays` jours, et, en dernière
+ * priorité, petite image des cartes qui n'en ont pas et logo de l'extension s'il manque.
  */
 export async function runSetJob(ctx: JobContext, job: Job): Promise<JobResult> {
   const language = jobLanguage(job)
@@ -158,7 +204,8 @@ export async function runSetJob(ctx: JobContext, job: Job): Promise<JobResult> {
   const cardJobs: NewJob[] = []
   const imageJobs: NewJob[] = []
 
-  for (const card of dedupeCards(detail.cards)) {
+  const listedCards = dedupeCards(detail.cards)
+  for (const card of listedCards) {
     const brief = { id: card.id, localId: card.localId, name: card.name, image: card.image, series: seriesId }
     const hash = await contentHash(brief)
     const known = existing.get(card.id)
@@ -174,6 +221,13 @@ export async function runSetJob(ctx: JobContext, job: Job): Promise<JobResult> {
     const imageChanged = card.image !== known.api_image_url || (known.series_id === null && seriesId !== null)
     if (needsImage(known, imageChanged, nowMs, config.missingRecheckDays)) imageJobs.push(imageJob(language, card.id))
   }
+
+  // Petites images (après l'image principale) et logo de l'extension.
+  const mainQueued = new Set(imageJobs.map((item) => item.target))
+  const lowJobs = listedCards
+    .filter((card) => needsLowImage(existing.get(card.id), mainQueued.has(card.id), nowMs, config.missingRecheckDays))
+    .map((card) => lowImageJob(language, card.id))
+  const logo = detail.logo && needsLogo(await setLogoState(db, internalId(language, setId)), detail.logo, nowMs, config.missingRecheckDays) ? [logoJob(language, setId)] : []
 
   // Cartes qui ne sont plus listées : marquées, jamais supprimées. Seules comptent les cartes déjà
   // listées par cette extension (`brief_hash` connu) : une carte venue de l'index `/cards` n'y a
@@ -209,6 +263,7 @@ export async function runSetJob(ctx: JobContext, job: Job): Promise<JobResult> {
     ...upsertCardBriefsStmts(db, language, setId, seriesId, changedBriefs, nowMs),
     ...enqueueStmts(db, 'image', language, imageJobs, { runId: job.run_id, maxAttempts: config.maxAttempts, nowMs }),
     ...enqueueStmts(db, 'card', language, cardJobs, { runId: job.run_id, maxAttempts: config.maxAttempts, nowMs }),
+    ...enqueueMediaStmts(db, language, [...lowJobs, ...logo], { runId: job.run_id, maxAttempts: config.maxAttempts, nowMs }),
   )
   if (vanished.length && plausibleRemoval) statements.push(markRemovedStmt(db, vanished, nowMs))
   return { kind: 'done', statements, httpStatus: outcome.status }

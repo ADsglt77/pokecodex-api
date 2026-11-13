@@ -18,7 +18,8 @@ export type JobType = (typeof JOB_TYPES)[number]
 /**
  * Ordre de traitement : catalogue, extensions, index des cartes, rapport, puis les images avant les
  * détails de cartes. Comme un détail de carte crée la tâche de son image, les images sont copiées au
- * fil de l'eau au lieu d'attendre la fin de tous les détails.
+ * fil de l'eau au lieu d'attendre la fin de tous les détails. Les copies secondaires (petites images,
+ * logos) passent après tout le reste : `MEDIA_PRIORITY`.
  */
 export const JOB_PRIORITY: Record<JobType, number> = {
   catalog: 0,
@@ -28,6 +29,36 @@ export const JOB_PRIORITY: Record<JobType, number> = {
   image: 4,
   card: 5,
 }
+
+/**
+ * Copies secondaires (petite image `low.webp` d'une carte, logo d'une extension) : tâches de type
+ * `image` (la contrainte CHECK de `job_type` n'est pas reconstruite), reconnues à leur charge utile
+ * `{ media: 'low' | 'logo' }` et à leur `dedupe_key` (`image_low:<langue>:<carte>`,
+ * `logo:<langue>:<extension>`). Priorité la plus basse : après toutes les autres tâches.
+ */
+export type MediaKind = 'low' | 'logo'
+export const MEDIA_PRIORITY = 6
+
+export const lowImageDedupeKey = (language: Language, cardTcgdexId: string): string => `image_low:${language}:${cardTcgdexId}`
+export const logoDedupeKey = (language: Language, setTcgdexId: string): string => `logo:${language}:${setTcgdexId}`
+
+/** Nature d'une copie secondaire, ou `null` pour toute autre tâche (dont l'image principale). */
+export function mediaKind(job: { job_type: string; payload_json: string | null }): MediaKind | null {
+  if (job.job_type !== 'image' || !job.payload_json) return null
+  try {
+    const media = (JSON.parse(job.payload_json) as { media?: unknown } | null)?.media
+    return media === 'low' || media === 'logo' ? media : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Type affiché d'une tâche (statistiques, erreurs) : `image_low` et `logo` pour les copies
+ * secondaires, sinon `job_type`. Expression SQL sur `import_jobs`.
+ */
+export const JOB_KIND_SQL = `CASE WHEN job_type = 'image' AND substr(dedupe_key, 1, 10) = 'image_low:' THEN 'image_low'
+  WHEN job_type = 'image' AND substr(dedupe_key, 1, 5) = 'logo:' THEN 'logo' ELSE job_type END`
 
 export interface Job {
   id: number
@@ -69,7 +100,7 @@ export function enqueueStmts(
   type: JobType,
   language: Language | null,
   jobs: NewJob[],
-  opts: { runId: number | null; maxAttempts: number; nowMs: number; notBeforeMs?: number },
+  opts: { runId: number | null; maxAttempts: number; nowMs: number; notBeforeMs?: number; priority?: number },
 ): D1PreparedStatement[] {
   const statements: D1PreparedStatement[] = []
   // Blocs de 500 lignes : chaque paramètre reste loin de la limite de 2 Mo par valeur.
@@ -101,7 +132,7 @@ export function enqueueStmts(
            updated_at = excluded.updated_at`,
         type,
         language,
-        JOB_PRIORITY[type],
+        opts.priority ?? JOB_PRIORITY[type],
         opts.maxAttempts,
         iso(opts.notBeforeMs ?? opts.nowMs),
         opts.runId,
@@ -114,12 +145,47 @@ export function enqueueStmts(
 }
 
 /**
+ * Remet en attente la tâche de petite image d'une carte, si elle existe et n'est plus active : celle
+ * qui s'est terminée sans rien copier faute d'image principale (`runLowImageJob` ne l'attend pas).
+ * Écrite avec la réussite de l'image principale ; sans tâche existante, rien (une carte sans petite
+ * image demandée n'en reçoit pas).
+ */
+export function reviveLowImageStmt(db: Db, language: Language, cardTcgdexId: string, nowMs: number): D1PreparedStatement {
+  return db.stmt(
+    `UPDATE import_jobs SET status = 'pending', attempts = 0, releases = 0, last_error = NULL,
+       next_attempt_at = ?2, completed_at = NULL, updated_at = ?2
+     WHERE dedupe_key = ?1 AND status IN ('done', 'failed', 'cancelled')`,
+    lowImageDedupeKey(language, cardTcgdexId),
+    iso(nowMs),
+  )
+}
+
+/** Crée (ou remet en attente) des copies secondaires : type `image`, priorité `MEDIA_PRIORITY`. */
+export function enqueueMediaStmts(
+  db: Db,
+  language: Language,
+  jobs: NewJob[],
+  opts: { runId: number | null; maxAttempts: number; nowMs: number },
+): D1PreparedStatement[] {
+  return enqueueStmts(db, 'image', language, jobs, { ...opts, priority: MEDIA_PRIORITY })
+}
+
+/**
  * Remet en attente les tâches dont le verrou a expiré (exécution interrompue). Celles qui ont
  * épuisé leurs tentatives échouent définitivement. Rend les tâches passées en échec.
  */
-export async function reclaimExpired(db: Db, nowMs: number): Promise<{ id: number; job_type: JobType; card_id: string | null }[]> {
+export interface ExpiredJob {
+  id: number
+  job_type: JobType
+  language: Language | null
+  target_id: string | null
+  card_id: string | null
+  payload_json: string | null
+}
+
+export async function reclaimExpired(db: Db, nowMs: number): Promise<ExpiredJob[]> {
   const now = iso(nowMs)
-  const rows = await db.all<{ id: number; job_type: JobType; card_id: string | null; status: string }>(
+  const rows = await db.all<ExpiredJob & { status: string }>(
     `UPDATE import_jobs SET
        status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END,
        last_error = CASE WHEN attempts >= max_attempts
@@ -128,10 +194,12 @@ export async function reclaimExpired(db: Db, nowMs: number): Promise<{ id: numbe
        completed_at = CASE WHEN attempts >= max_attempts THEN ?1 ELSE NULL END,
        next_attempt_at = ?1, locked_until = NULL, lock_token = NULL, updated_at = ?1
      WHERE status = 'running' AND locked_until <= ?1
-     RETURNING id, job_type, card_id, status`,
+     RETURNING id, job_type, language, target_id, card_id, payload_json, status`,
     now,
   )
-  return rows.filter((row) => row.status === 'failed')
+  return rows
+    .filter((row) => row.status === 'failed')
+    .map((row) => ({ id: row.id, job_type: row.job_type, language: row.language, target_id: row.target_id, card_id: row.card_id, payload_json: row.payload_json }))
 }
 
 /**

@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest'
 import { parseConfig, type ConfigSource } from '../src/config'
 import { Usage } from '../src/db'
 import { Health, TcgdexClient } from '../src/tcgdex/client'
-import { checkWebp, imageCandidates } from '../src/tcgdex/images'
+import { checkWebp, imageCandidates, logoImageUrl, lowImageUrl } from '../src/tcgdex/images'
 import { parseCardDetail, parseCardList, parseSeriesList, parseSetDetail, parseSetList } from '../src/tcgdex/types'
 import { readCapped } from '../src/utils/http'
 import { RateLimiter } from '../src/utils/limiter'
@@ -86,5 +86,17 @@ describe('TCGdex réel', () => {
     expect(recovered.check?.ok).toBe(true)
     const missing = await image('https://assets.tcgdex.net/fr/swsh/swsh3/9999/high.webp')
     expect(missing.status).toBe(404)
+  })
+
+  it('petite image (low.webp, même base que high.webp) et logo d’extension (<logo>.webp)', async () => {
+    const low = await image(lowImageUrl('https://assets.tcgdex.net/fr/swsh/swsh3/136/high.webp', 'fr') ?? '')
+    expect(low.status).toBe(200)
+    expect(low.check?.ok).toBe(true)
+    const set = parseSetDetail(await json(client.apiUrl('fr', 'sets', 'swsh3')))
+    const logoUrl = logoImageUrl(set.logo, 'fr')
+    expect(logoUrl).toBe('https://assets.tcgdex.net/fr/swsh/swsh3/logo.webp')
+    const logo = await image(logoUrl ?? '')
+    expect(logo.status).toBe(200)
+    expect(logo.check?.ok).toBe(true)
   })
 })
