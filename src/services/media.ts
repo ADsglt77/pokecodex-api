@@ -1,7 +1,7 @@
 /**
- * Copies secondaires, pour l'affichage du site : petite image `low.webp` de chaque carte (grilles) et
- * logo de chaque extension. Tâches `image` de plus basse priorité (`MEDIA_PRIORITY`), reconnues à
- * leur charge utile `{ media: 'low' | 'logo' }`.
+ * Copies secondaires, pour l'affichage du site : petite image `low.webp` de chaque carte (grilles),
+ * logo et symbole de chaque extension. Tâches `image` de plus basse priorité (`MEDIA_PRIORITY`),
+ * reconnues à leur charge utile `{ media: 'low' | 'logo' | 'symbol' }`.
  *
  * Mêmes garanties que l'image principale (`downloader.ts`) :
  *   - un objet R2 valide n'est jamais écrasé ni retéléchargé : un objet déjà présent (copie faite
@@ -9,7 +9,9 @@
  *     jamais remplacé ;
  *   - le fichier est lu en flux dans la limite de `maxImageBytes`, puis validé exactement comme
  *     l'image principale (statut, `image/webp`, signature RIFF…WEBP, tailles, MD5 = ETag), et écrit
- *     dans R2 avec le contrôle SHA-256 de R2 ; D1 n'est mis à jour qu'une fois l'écriture confirmée ;
+ *     dans R2 avec le contrôle SHA-256 de R2 ; D1 n'est mis à jour qu'une fois l'écriture confirmée.
+ *     Seule exception : le CDN sert les symboles en `application/octet-stream`, accepté pour eux
+ *     seuls (la signature, les tailles et le MD5 restent exigés) ;
  *   - un 404 est une absence confirmée (aucune nouvelle tentative : revérifiée par la synchronisation
  *     hebdomadaire après `missingRecheckDays` jours) ; un 429 rend la tâche ; une erreur serveur,
  *     réseau ou un transfert corrompu sont retentés, puis `download_error`.
@@ -19,6 +21,7 @@
 
 import { IMAGES_PREFIX } from '../config'
 import type { Db } from '../db'
+import type { Language } from '../config'
 import {
   imageFailureStmt,
   isValidImageStatus,
@@ -26,14 +29,18 @@ import {
   logoSuccessStmt,
   lowImageFailureStmt,
   lowImageSuccessStmt,
+  symbolFailureStmt,
+  symbolSuccessStmt,
   type CardForJob,
   type MediaFailureStatus,
-  type SetForLogoJob,
+  type MediaStatus,
+  type SetForMediaJob,
+  type SetMediaKind,
 } from '../repositories/catalog'
 import { dedupeKey, mediaKind, type Job } from '../repositories/jobs'
-import { checkWebp, isLowQualitySource, logoImageUrl, lowImageUrl } from '../tcgdex/images'
+import { checkWebp, isLowQualitySource, logoImageUrl, lowImageUrl, symbolImageUrl, type WebpCheckOptions } from '../tcgdex/images'
 import { BodyTooLargeError, readCapped } from '../utils/http'
-import { internalId, lowImageKey, setLogoKey } from '../utils/keys'
+import { internalId, lowImageKey, setLogoKey, setSymbolKey } from '../utils/keys'
 import { errorMessage } from '../utils/log'
 import { jobLanguage, jobTarget, rateLimitDelayMs, type JobContext, type JobResult } from './context'
 
@@ -51,7 +58,7 @@ type CopyResult =
  * Télécharge `url`, la valide comme une image principale et l'écrit à `key` (sous `cards/`). Ne lit
  * ni n'écrit D1. L'absence d'objet valide à `key` doit avoir été vérifiée avant.
  */
-async function copyWebp(ctx: JobContext, url: string, key: string, customMetadata: Record<string, string>): Promise<CopyResult> {
+async function copyWebp(ctx: JobContext, url: string, key: string, customMetadata: Record<string, string>, checkOptions: WebpCheckOptions = {}): Promise<CopyResult> {
   if (!key.startsWith(IMAGES_PREFIX)) throw new Error(`clé R2 hors du préfixe ${IMAGES_PREFIX} : ${key}`)
   const { client, bucket, config, db } = ctx
   const outcome = await client.get(url, 'image/webp')
@@ -70,7 +77,7 @@ async function copyWebp(ctx: JobContext, url: string, key: string, customMetadat
     if (error instanceof BodyTooLargeError) return { kind: 'invalid', reason: error.message, httpStatus: outcome.status }
     return { kind: 'transient', reason: `lecture interrompue : ${errorMessage(error)}`, httpStatus: outcome.status }
   }
-  const check = await checkWebp(bytes, outcome.response.headers, config)
+  const check = await checkWebp(bytes, outcome.response.headers, config, checkOptions)
   if (!check.ok) return check.transient ? { kind: 'transient', reason: check.reason, httpStatus: outcome.status } : { kind: 'invalid', reason: check.reason, httpStatus: outcome.status }
 
   let stored: R2Object | null
@@ -178,43 +185,89 @@ export async function runLowImageJob(ctx: JobContext, job: Job, card: CardForJob
   return { kind: 'done', httpStatus: copy.httpStatus, statements: [lowImageSuccessStmt(db, card.id, { key, size: copy.size, sha256: copy.sha256 }, ctx.now())] }
 }
 
-/** Logo d'une extension : `<logo_url>.webp`, copié à `cards/<langue>/<extension>/_logo.webp`. */
-export async function runLogoJob(ctx: JobContext, job: Job, set: SetForLogoJob | undefined): Promise<JobResult> {
+/** Ce qui distingue le logo du symbole d'une extension ; le reste du traitement est commun. */
+interface SetMediaSpec {
+  /** Nom dans les messages (« logo », « symbole » : tous deux masculins). */
+  label: string
+  /** URL de base donnée par l'API, statut et clé R2 enregistrés. */
+  read: (set: SetForMediaJob) => { url: string | null; status: MediaStatus | null; key: string | null }
+  key: (language: Language, setTcgdexId: string) => string
+  webpUrl: (url: string | null, language: Language) => string | null
+  success: typeof logoSuccessStmt
+  failure: typeof logoFailureStmt
+  check: WebpCheckOptions
+}
+
+const SET_MEDIA: Record<SetMediaKind, SetMediaSpec> = {
+  logo: {
+    label: 'logo',
+    read: (set) => ({ url: set.logo_url, status: set.logo_status, key: set.logo_r2_key }),
+    key: setLogoKey,
+    webpUrl: logoImageUrl,
+    success: logoSuccessStmt,
+    failure: logoFailureStmt,
+    check: {},
+  },
+  symbol: {
+    label: 'symbole',
+    read: (set) => ({ url: set.symbol_url, status: set.symbol_status, key: set.symbol_r2_key }),
+    key: setSymbolKey,
+    webpUrl: symbolImageUrl,
+    success: symbolSuccessStmt,
+    failure: symbolFailureStmt,
+    // Le CDN sert les symboles en `application/octet-stream` (et seulement eux).
+    check: { allowOctetStream: true },
+  },
+}
+
+/**
+ * Image d'une extension (logo ou symbole) : `<url>.webp`, copiée à
+ * `cards/<langue>/<extension>/_logo.webp` ou `_symbol.webp`.
+ */
+async function runSetMediaJob(ctx: JobContext, job: Job, set: SetForMediaJob | undefined, kind: SetMediaKind): Promise<JobResult> {
+  const spec = SET_MEDIA[kind]
   const language = jobLanguage(job)
   const setTcgdexId = jobTarget(job)
   const { db } = ctx
-  if (!set) return { kind: 'failed', error: `logo : extension ${language}/${setTcgdexId} inconnue en base`, httpStatus: null }
-  if (set.logo_status === 'downloaded' && set.logo_r2_key) return { kind: 'done', statements: [] }
+  if (!set) return { kind: 'failed', error: `${spec.label} : extension ${language}/${setTcgdexId} inconnue en base`, httpStatus: null }
+  const media = spec.read(set)
+  if (media.status === 'downloaded' && media.key) return { kind: 'done', statements: [] }
 
-  const candidate = set.logo_url ? `${set.logo_url}.webp` : null
-  const record = (status: MediaFailureStatus, reason: string) => logoFailureStmt(db, set.id, { status, reason, sourceUrl: candidate }, ctx.now())
-  const key = setLogoKey(language, set.tcgdex_id)
+  const candidate = media.url ? `${media.url}.webp` : null
+  const record = (status: MediaFailureStatus, reason: string) => spec.failure(db, set.id, { status, reason, sourceUrl: candidate }, ctx.now())
+  const key = spec.key(language, set.tcgdex_id)
 
   let existing: Existing
   try {
     existing = await existingObject(ctx, key, ['setId', set.tcgdex_id])
   } catch (error) {
     const message = `lecture R2 échouée : ${errorMessage(error)}`
-    return { kind: 'retry', error: `logo ${set.id} : ${message}`, httpStatus: null, exhausted: [record('download_error', message)] }
+    return { kind: 'retry', error: `${spec.label} ${set.id} : ${message}`, httpStatus: null, exhausted: [record('download_error', message)] }
   }
   if (existing.kind === 'ours') {
-    return { kind: 'done', statements: [logoSuccessStmt(db, set.id, { key, sourceUrl: null, size: existing.size, sha256: existing.sha256 }, ctx.now())] }
+    return { kind: 'done', statements: [spec.success(db, set.id, { key, sourceUrl: null, size: existing.size, sha256: existing.sha256 }, ctx.now())] }
   }
   if (existing.kind === 'foreign') return { kind: 'done', statements: [record('download_error', `objet R2 déjà présent à ${key}, étranger à cette extension : jamais écrasé`)] }
 
-  if (!set.logo_url) return { kind: 'done', statements: [record('missing_api_url', 'aucun logo donné par l’API')] }
-  const url = logoImageUrl(set.logo_url, language)
-  if (!url) return { kind: 'done', statements: [record('missing_api_url', `URL de logo refusée (hors du CDN de TCGdex ou d’une autre langue) : ${set.logo_url}`)] }
+  if (!media.url) return { kind: 'done', statements: [record('missing_api_url', `aucun ${spec.label} donné par l’API`)] }
+  const url = spec.webpUrl(media.url, language)
+  if (!url) return { kind: 'done', statements: [record('missing_api_url', `URL de ${spec.label} refusée (hors du CDN de TCGdex ou d’une autre langue) : ${media.url}`)] }
 
-  const copy = await copyWebp(ctx, url, key, { variant: 'logo', language, setId: set.tcgdex_id })
-  if (copy.kind !== 'stored') return failureResult(copy, url, `logo ${set.id}`, record, ctx)
-  return { kind: 'done', httpStatus: copy.httpStatus, statements: [logoSuccessStmt(db, set.id, { key, sourceUrl: url, size: copy.size, sha256: copy.sha256 }, ctx.now())] }
+  const copy = await copyWebp(ctx, url, key, { variant: kind, language, setId: set.tcgdex_id }, spec.check)
+  if (copy.kind !== 'stored') return failureResult(copy, url, `${spec.label} ${set.id}`, record, ctx)
+  return { kind: 'done', httpStatus: copy.httpStatus, statements: [spec.success(db, set.id, { key, sourceUrl: url, size: copy.size, sha256: copy.sha256 }, ctx.now())] }
 }
+
+/** Logo d'une extension : `<logo_url>.webp`, copié à `cards/<langue>/<extension>/_logo.webp`. */
+export const runLogoJob = (ctx: JobContext, job: Job, set: SetForMediaJob | undefined): Promise<JobResult> => runSetMediaJob(ctx, job, set, 'logo')
+
+/** Symbole d'une extension : `<symbol_url>.webp`, copié à `cards/<langue>/<extension>/_symbol.webp`. */
+export const runSymbolJob = (ctx: JobContext, job: Job, set: SetForMediaJob | undefined): Promise<JobResult> => runSetMediaJob(ctx, job, set, 'symbol')
 
 /**
  * Écritures d'un échec définitif sans motif propre (tentatives épuisées, verrou expiré, rendue trop
  * souvent) d'une tâche `image` : la cible passe en `download_error` — la carte pour l'image
- * principale, sa petite image, ou le logo de l'extension.
+ * principale, sa petite image, ou le logo ou le symbole de l'extension.
  */
 export function imageJobFailureStmts(
   db: Db,
@@ -224,9 +277,9 @@ export function imageJobFailureStmts(
 ): D1PreparedStatement[] {
   if (job.job_type !== 'image') return []
   const media = mediaKind(job)
-  if (media === 'logo') {
+  if (media === 'logo' || media === 'symbol') {
     if ((job.language !== 'fr' && job.language !== 'ja') || !job.target_id) return []
-    return [logoFailureStmt(db, internalId(job.language, job.target_id), { status: 'download_error', reason }, nowMs)]
+    return [SET_MEDIA[media].failure(db, internalId(job.language, job.target_id), { status: 'download_error', reason }, nowMs)]
   }
   if (!job.card_id) return []
   if (media === 'low') return [lowImageFailureStmt(db, job.card_id, { status: 'download_error', reason }, nowMs)]

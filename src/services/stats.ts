@@ -49,6 +49,13 @@ export interface LanguageStats {
   logosErrors: number
   logosPending: number
   logoBytes: number
+  /** Extensions dont l'API donne un symbole ; symboles copiés, introuvables, en erreur, à faire. */
+  setsWithSymbol: number
+  symbolsStored: number
+  symbolsMissing: number
+  symbolsErrors: number
+  symbolsPending: number
+  symbolBytes: number
 }
 
 export interface JobCount {
@@ -73,9 +80,10 @@ export interface Stats {
     bytes: number
     lowImagesStored: number
     logosStored: number
-    /** Octets des petites images et des logos. */
+    symbolsStored: number
+    /** Octets des petites images, des logos et des symboles. */
     mediaBytes: number
-    /** Volume total sous `cards/` (images principales, petites images, logos) : celui du plafond. */
+    /** Volume total sous `cards/` (images principales, petites images, logos, symboles) : celui du plafond. */
     storedBytes: number
     progressPercent: number
     jobsTotal: number
@@ -126,7 +134,13 @@ async function languageStats(db: Db, language: Language): Promise<LanguageStats>
        (SELECT COUNT(*) FROM sets WHERE language = ?1 AND logo_status IN ('missing_api_url', 'not_found_on_cdn')) AS logosMissing,
        (SELECT COUNT(*) FROM sets WHERE language = ?1 AND logo_status IN ('download_error', 'invalid_image')) AS logosErrors,
        (SELECT COUNT(*) FROM sets WHERE language = ?1 AND logo_url IS NOT NULL AND logo_status IS NULL) AS logosPending,
-       (SELECT COALESCE(SUM(logo_file_size), 0) FROM sets WHERE language = ?1 AND logo_status = 'downloaded') AS logoBytes
+       (SELECT COALESCE(SUM(logo_file_size), 0) FROM sets WHERE language = ?1 AND logo_status = 'downloaded') AS logoBytes,
+       (SELECT COUNT(*) FROM sets WHERE language = ?1 AND symbol_url IS NOT NULL) AS setsWithSymbol,
+       (SELECT COUNT(*) FROM sets WHERE language = ?1 AND symbol_status = 'downloaded') AS symbolsStored,
+       (SELECT COUNT(*) FROM sets WHERE language = ?1 AND symbol_status IN ('missing_api_url', 'not_found_on_cdn')) AS symbolsMissing,
+       (SELECT COUNT(*) FROM sets WHERE language = ?1 AND symbol_status IN ('download_error', 'invalid_image')) AS symbolsErrors,
+       (SELECT COUNT(*) FROM sets WHERE language = ?1 AND symbol_url IS NOT NULL AND symbol_status IS NULL) AS symbolsPending,
+       (SELECT COALESCE(SUM(symbol_file_size), 0) FROM sets WHERE language = ?1 AND symbol_status = 'downloaded') AS symbolBytes
      FROM cards WHERE language = ?1`,
     language,
   )
@@ -144,7 +158,7 @@ async function languageStats(db: Db, language: Language): Promise<LanguageStats>
 
 export async function collectStats(db: Db, config: Config, nowMs: number): Promise<Stats> {
   const languages = await Promise.all(config.languages.map((language) => languageStats(db, language)))
-  // Petites images et logos (tâches `image`) comptés à part : `image_low`, `logo`.
+  // Petites images, logos et symboles (tâches `image`) comptés à part : `image_low`, `logo`, `symbol`.
   const jobs = await db.all<JobCount>(
     `SELECT ${JOB_KIND_SQL} AS job_type, status, COUNT(*) AS n FROM import_jobs GROUP BY 1, status ORDER BY 1, status`,
   )
@@ -200,8 +214,9 @@ export async function collectStats(db: Db, config: Config, nowMs: number): Promi
       bytes: sum('bytes'),
       lowImagesStored: sum('lowImagesStored'),
       logosStored: sum('logosStored'),
-      mediaBytes: sum('lowBytes') + sum('logoBytes'),
-      storedBytes: sum('bytes') + sum('lowBytes') + sum('logoBytes'),
+      symbolsStored: sum('symbolsStored'),
+      mediaBytes: sum('lowBytes') + sum('logoBytes') + sum('symbolBytes'),
+      storedBytes: sum('bytes') + sum('lowBytes') + sum('logoBytes') + sum('symbolBytes'),
       progressPercent: percent(jobsFinished, jobsTotal),
       jobsTotal,
       jobsActive,
@@ -248,6 +263,7 @@ export function formatStatus(stats: Stats): string {
       `${pad('En attente')}: ${n(lang.imagesPending)}`,
       `${pad('Petites images (low)')}: ${n(lang.lowImagesStored)} / ${n(lang.imagesStored)} (introuvables ${n(lang.lowImagesMissing)}, erreurs ${n(lang.lowImagesErrors)}, à faire ${n(lang.lowImagesPending)})`,
       `${pad('Logos d’extension')}: ${n(lang.logosStored)} / ${n(lang.setsWithLogo)} (introuvables ${n(lang.logosMissing)}, erreurs ${n(lang.logosErrors)}, à faire ${n(lang.logosPending)})`,
+      `${pad('Symboles d’extension')}: ${n(lang.symbolsStored)} / ${n(lang.setsWithSymbol)} (introuvables ${n(lang.symbolsMissing)}, erreurs ${n(lang.symbolsErrors)}, à faire ${n(lang.symbolsPending)})`,
       '',
     )
   }
@@ -258,6 +274,7 @@ export function formatStatus(stats: Stats): string {
     `${pad('Images stockées R2')}: ${n(stats.total.imagesStored)}`,
     `${pad('Petites images R2')}: ${n(stats.total.lowImagesStored)}`,
     `${pad('Logos R2')}: ${n(stats.total.logosStored)}`,
+    `${pad('Symboles R2')}: ${n(stats.total.symbolsStored)}`,
     `${pad('Volume stocké')}: ${gb(stats.total.storedBytes)} Go`,
     `${pad('Progression')}: ${stats.total.progressPercent.toLocaleString('fr-FR')} % (${n(stats.total.jobsTotal - stats.total.jobsActive)} / ${n(stats.total.jobsTotal)} tâches)`,
     `${pad('Dernière exécution')}: ${lastTick?.finishedAt ?? 'aucune'}${lastTick?.stopReason ? ` (${lastTick.stopReason})` : ''}`,

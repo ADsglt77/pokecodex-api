@@ -1,8 +1,8 @@
 /**
  * Copies secondaires pour l'affichage du site (src/services/media.ts) : petite image `low.webp` de
- * chaque carte à image valide (clé `….low.webp`) et logo de chaque extension (`_logo.webp`) ;
- * création des tâches par la tâche `set` et par `POST /admin/sync/backfill-media`, priorités,
- * idempotence, plafonds de coût, statistiques et audit.
+ * chaque carte à image valide (clé `….low.webp`), logo (`_logo.webp`) et symbole (`_symbol.webp`)
+ * de chaque extension ; création des tâches par la tâche `set` et par
+ * `POST /admin/sync/backfill-media`, priorités, idempotence, plafonds de coût, statistiques et audit.
  *
  * Aucun appel réseau : TCGdex est simulé (FakeTcgdex), l'horloge aussi (Clock).
  */
@@ -14,12 +14,12 @@ import type { Language } from '../src/config'
 import { Db } from '../src/db'
 import { claimJobs, enqueueMediaStmts, enqueueStmts, JOB_PRIORITY, MEDIA_PRIORITY, mediaKind } from '../src/repositories/jobs'
 import { storedBytes } from '../src/repositories/runs'
-import { imageJob, logoJob, lowImageJob } from '../src/services/catalog'
+import { imageJob, logoJob, lowImageJob, symbolJob } from '../src/services/catalog'
 import { runTick, type RunnerDeps, type TickResult } from '../src/services/runner'
 import type { Stats } from '../src/services/stats'
 import { startSync } from '../src/services/sync'
-import { isLowQualitySource, logoImageUrl, lowImageUrl } from '../src/tcgdex/images'
-import { cardImageKey, encodeKeySegment, lowImageKey, setLogoKey } from '../src/utils/keys'
+import { checkWebp, isLowQualitySource, logoImageUrl, lowImageUrl, symbolImageUrl } from '../src/tcgdex/images'
+import { cardImageKey, encodeKeySegment, lowImageKey, setLogoKey, setSymbolKey } from '../src/utils/keys'
 import { iso } from '../src/utils/time'
 import { ASSETS, Clock, drain, FakeTcgdex, makeDeps, md5Hex, one, resetAll, rows, sampleCatalog, sha256Hex, webp } from './helpers'
 
@@ -37,6 +37,11 @@ const KEY_136 = 'cards/fr/swsh3/swsh3-136.webp'
 const LOW_KEY_136 = 'cards/fr/swsh3/swsh3-136.low.webp'
 const LOGO = `${ASSETS}/fr/swsh/swsh3/logo`
 const LOGO_KEY = 'cards/fr/swsh3/_logo.webp'
+// Les symboles sont souvent sous `univ` (ex. réel : https://assets.tcgdex.net/univ/sv/sv03.5/symbol).
+const SYMBOL = `${ASSETS}/univ/swsh/swsh3/symbol`
+const SYMBOL_KEY = 'cards/fr/swsh3/_symbol.webp'
+const SYMBOL_JA = `${ASSETS}/ja/SV/SV1a/symbol`
+const SYMBOL_KEY_JA = 'cards/ja/SV1a/_symbol.webp'
 
 const db = () => new Db(env.DB)
 const tick = (deps: RunnerDeps): Promise<TickResult> => runTick(deps, { trigger: 'test' })
@@ -110,11 +115,26 @@ async function seedPendingMain(clock: Clock, tcgdexId = 'swsh3-136'): Promise<{ 
   return { cardId }
 }
 
-/** Insère une extension, avec un logo éventuel. */
-async function seedSet(clock: Clock, language: Language, set: string, logoUrl: string | null, extra: { logoStatus?: string; logoKey?: string; logoSize?: number; logoCheckedAt?: string; logoSourceUrl?: string } = {}): Promise<void> {
+interface SetSeed {
+  logoStatus?: string
+  logoKey?: string
+  logoSize?: number
+  logoCheckedAt?: string
+  logoSourceUrl?: string
+  symbolUrl?: string
+  symbolStatus?: string
+  symbolKey?: string
+  symbolSize?: number
+  symbolCheckedAt?: string
+  symbolSourceUrl?: string
+}
+
+/** Insère une extension, avec un logo et un symbole éventuels. */
+async function seedSet(clock: Clock, language: Language, set: string, logoUrl: string | null, extra: SetSeed = {}): Promise<void> {
   await env.DB.prepare(
-    `INSERT INTO sets (id, tcgdex_id, language, name, logo_url, logo_status, logo_r2_key, logo_file_size, logo_checked_at, logo_source_url, created_at, updated_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)`,
+    `INSERT INTO sets (id, tcgdex_id, language, name, logo_url, logo_status, logo_r2_key, logo_file_size, logo_checked_at, logo_source_url,
+       symbol_url, symbol_status, symbol_r2_key, symbol_file_size, symbol_checked_at, symbol_source_url, created_at, updated_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)`,
   )
     .bind(
       `${language}:${set}`,
@@ -127,6 +147,12 @@ async function seedSet(clock: Clock, language: Language, set: string, logoUrl: s
       extra.logoSize ?? null,
       extra.logoCheckedAt ?? null,
       extra.logoSourceUrl ?? null,
+      extra.symbolUrl ?? null,
+      extra.symbolStatus ?? null,
+      extra.symbolKey ?? null,
+      extra.symbolSize ?? null,
+      extra.symbolCheckedAt ?? null,
+      extra.symbolSourceUrl ?? null,
       iso(clock.now()),
     )
     .run()
@@ -140,6 +166,16 @@ async function enqueueLow(clock: Clock, language: Language, tcgdexId: string, ma
 async function enqueueLogo(clock: Clock, language: Language, set: string, maxAttempts = 5): Promise<void> {
   const database = db()
   await database.batch(enqueueMediaStmts(database, language, [logoJob(language, set)], { runId: null, maxAttempts, nowMs: clock.now() }))
+}
+
+async function enqueueSymbol(clock: Clock, language: Language, set: string, maxAttempts = 5): Promise<void> {
+  const database = db()
+  await database.batch(enqueueMediaStmts(database, language, [symbolJob(language, set)], { runId: null, maxAttempts, nowMs: clock.now() }))
+}
+
+/** Symbole servi comme par le vrai CDN : 200, `application/octet-stream`, ETag = MD5 (sondé le 14/11/2026). */
+function addSymbol(fake: FakeTcgdex, url: string, body: Uint8Array): void {
+  fake.addImage(url, body, { headers: { 'content-type': 'application/octet-stream' } })
 }
 
 interface LowRow {
@@ -168,6 +204,22 @@ interface LogoRow {
 
 const logoRow = (setId: string) =>
   one<LogoRow>(`SELECT logo_status, logo_r2_key, logo_source_url, logo_file_size, logo_sha256, logo_failure_reason FROM sets WHERE id = ?1`, setId)
+
+interface SymbolRow {
+  symbol_status: string | null
+  symbol_r2_key: string | null
+  symbol_source_url: string | null
+  symbol_file_size: number | null
+  symbol_sha256: string | null
+  symbol_checked_at: string | null
+  symbol_failure_reason: string | null
+}
+
+const symbolRow = (setId: string) =>
+  one<SymbolRow>(
+    `SELECT symbol_status, symbol_r2_key, symbol_source_url, symbol_file_size, symbol_sha256, symbol_checked_at, symbol_failure_reason FROM sets WHERE id = ?1`,
+    setId,
+  )
 
 const jobByKey = (dedupeKey: string) =>
   one<{ job_type: string; status: string; attempts: number; releases: number; priority: number; run_id: number | null; payload_json: string | null; last_error: string | null }>(
@@ -210,6 +262,19 @@ function catalogWithMedia(): FakeTcgdex {
   fake.addImage(`${ASSETS}/ja/SV/SV1a/001/low.webp`, webp(140, 23))
   fake.addImage(`${ASSETS}/ja/SV/SV1a/002/low.webp`, webp(150, 24))
   fake.addImage(`${LOGO}.webp`, webp(500, 25))
+  return fake
+}
+
+/** Le même catalogue, avec un symbole pour swsh3 (sous `univ`) et pour SV1a (JA), servis comme par le vrai CDN. */
+function catalogWithSymbols(): FakeTcgdex {
+  const fake = catalogWithMedia()
+  const swsh3 = fake.sets.fr.find((set) => set.id === 'swsh3')
+  const sv1a = fake.sets.ja.find((set) => set.id === 'SV1a')
+  if (!swsh3 || !sv1a) throw new Error('catalogue de référence inattendu')
+  swsh3.symbol = SYMBOL
+  sv1a.symbol = SYMBOL_JA
+  addSymbol(fake, `${SYMBOL}.webp`, webp(352, 41))
+  addSymbol(fake, `${SYMBOL_JA}.webp`, webp(360, 42))
   return fake
 }
 
@@ -280,15 +345,86 @@ describe('clés R2 et URL des copies secondaires', () => {
     }
   })
 
-  it('mediaKind : seules les tâches image avec { media: low | logo } sont des copies secondaires', () => {
+  it('mediaKind : seules les tâches image avec { media: low | logo | symbol } sont des copies secondaires', () => {
     expect(mediaKind({ job_type: 'image', payload_json: '{"media":"low"}' })).toBe('low')
     expect(mediaKind({ job_type: 'image', payload_json: '{"media":"logo"}' })).toBe('logo')
+    expect(mediaKind({ job_type: 'image', payload_json: '{"media":"symbol"}' })).toBe('symbol')
     expect(mediaKind({ job_type: 'image', payload_json: null })).toBeNull()
     expect(mediaKind({ job_type: 'image', payload_json: '{"media":"autre"}' })).toBeNull()
+    expect(mediaKind({ job_type: 'image', payload_json: '{"media":"Symbol"}' })).toBeNull()
     expect(mediaKind({ job_type: 'image', payload_json: 'pas du json' })).toBeNull()
     expect(mediaKind({ job_type: 'card', payload_json: '{"media":"low"}' })).toBeNull()
+    expect(mediaKind({ job_type: 'set', payload_json: '{"media":"symbol"}' })).toBeNull()
     expect(lowImageJob('fr', 'swsh3-136')).toEqual({ target: 'swsh3-136', cardId: 'fr:swsh3-136', dedupeKey: 'image_low:fr:swsh3-136', payload: { media: 'low' } })
     expect(logoJob('ja', 'SM1+')).toEqual({ target: 'SM1+', cardId: null, dedupeKey: 'logo:ja:SM1+', payload: { media: 'logo' } })
+    expect(symbolJob('fr', 'sv03.5')).toEqual({ target: 'sv03.5', cardId: null, dedupeKey: 'symbol:fr:sv03.5', payload: { media: 'symbol' } })
+  })
+
+  it('setSymbolKey : « cards/<langue>/<extension encodée>/_symbol.webp », sans collision avec une carte ni avec le logo', () => {
+    expect(setSymbolKey('fr', 'swsh3')).toBe(SYMBOL_KEY)
+    expect(setSymbolKey('fr', 'sv03.5')).toBe('cards/fr/sv03.5/_symbol.webp')
+    expect(setSymbolKey('ja', 'SM1+')).toBe('cards/ja/SM1_2B/_symbol.webp')
+    expect(setSymbolKey('fr', 'swsh3')).not.toBe(setLogoKey('fr', 'swsh3'))
+    // `s` n'est pas un chiffre hexadécimal : aucun segment encodé ne peut commencer par « _symbol ».
+    for (const id of ['_symbol', '_symbol.webp', 'symbol', '_s', '_SYMBOL', 'swsh3-_symbol']) {
+      expect(encodeKeySegment(id), id).toMatch(/^(?:[A-Za-z0-9.-]|_[0-9A-F]{2})+$/)
+      expect(cardImageKey('fr', 'swsh3', id), id).not.toBe(setSymbolKey('fr', 'swsh3'))
+      expect(lowImageKey(cardImageKey('fr', 'swsh3', id)), id).not.toBe(setSymbolKey('fr', 'swsh3'))
+    }
+  })
+
+  it('symbolImageUrl : « <symbol>.webp » sur le CDN, dans la langue de l’extension ou univ ; sinon refusée', () => {
+    expect(symbolImageUrl(`${ASSETS}/univ/sv/sv03.5/symbol`, 'fr')).toBe(`${ASSETS}/univ/sv/sv03.5/symbol.webp`)
+    expect(symbolImageUrl(`${ASSETS}/univ/sv/sv03.5/symbol`, 'ja')).toBe(`${ASSETS}/univ/sv/sv03.5/symbol.webp`)
+    expect(symbolImageUrl(SYMBOL_JA, 'ja')).toBe(`${SYMBOL_JA}.webp`)
+    for (const [url, language] of [
+      [null, 'fr'],
+      [SYMBOL_JA, 'fr'],
+      [`${ASSETS}/en/swsh/swsh3/symbol`, 'fr'],
+      ['https://evil.example.com/univ/swsh/swsh3/symbol', 'fr'],
+      ['http://assets.tcgdex.net/univ/swsh/swsh3/symbol', 'fr'],
+      [`${SYMBOL}?v=2`, 'fr'],
+      [`${SYMBOL}#x`, 'fr'],
+      [`${ASSETS}/univ/../ja/SV1a/symbol`, 'fr'],
+      [`${ASSETS}/univ/%2E%2E/en/symbol`, 'fr'],
+      [`${ASSETS}/univ/swsh//symbol`, 'fr'],
+      [`${SYMBOL}/`, 'fr'],
+      ['https://assets.tcgdex.net.evil.example/univ/symbol', 'fr'],
+    ] as const) {
+      expect(symbolImageUrl(url, language), String(url)).toBeNull()
+    }
+  })
+
+  it('checkWebp : « application/octet-stream » accepté seulement sur demande (symboles), signature, tailles et MD5 toujours exigés', async () => {
+    const limits = { minImageBytes: 100, maxImageBytes: 8_000_000 }
+    const headers = async (body: Uint8Array, contentType: string, etag?: string) =>
+      new Headers({ 'content-type': contentType, 'content-length': String(body.byteLength), etag: etag ?? `"${await md5Hex(body)}"` })
+    const body = webp(352, 41)
+    const octet = await headers(body, 'application/octet-stream')
+
+    // Par défaut (images principales, petites images, logos) : refusé.
+    expect(await checkWebp(body, octet, limits)).toEqual({ ok: false, reason: 'type MIME inattendu : application/octet-stream', transient: false })
+    expect(await checkWebp(body, octet, limits, { allowOctetStream: false })).toMatchObject({ ok: false })
+    // Symboles : accepté, avec les mêmes empreintes que pour image/webp.
+    const accepted = await checkWebp(body, octet, limits, { allowOctetStream: true })
+    expect(accepted).toEqual({ ok: true, sha256: await sha256Hex(body), md5: await md5Hex(body) })
+    expect(await checkWebp(body, await headers(body, 'Application/Octet-Stream; charset=binary'), limits, { allowOctetStream: true })).toMatchObject({ ok: true })
+    expect(await checkWebp(body, await headers(body, 'image/webp'), limits, { allowOctetStream: true })).toMatchObject({ ok: true })
+
+    // Aucun autre type n'est toléré, même pour un symbole.
+    for (const type of ['text/html', 'application/json', 'application/octet-stream, text/html', 'image/png']) {
+      expect(await checkWebp(body, await headers(body, type), limits, { allowOctetStream: true }), type).toMatchObject({ ok: false, transient: false, reason: expect.stringContaining('type MIME inattendu') })
+    }
+    // Le contenu reste vérifié : signature, taille minimale, MD5 = ETag, longueur annoncée.
+    const png = new Uint8Array(300)
+    png.set([0x89, 0x50, 0x4e, 0x47])
+    expect(await checkWebp(png, await headers(png, 'application/octet-stream'), limits, { allowOctetStream: true })).toMatchObject({ ok: false, transient: false, reason: expect.stringContaining('signature WebP absente') })
+    const tiny = webp(60, 1)
+    expect(await checkWebp(tiny, await headers(tiny, 'application/octet-stream'), limits, { allowOctetStream: true })).toMatchObject({ ok: false, transient: false, reason: expect.stringContaining('petit') })
+    expect(await checkWebp(body, await headers(body, 'application/octet-stream', '"00112233445566778899aabbccddeeff"'), limits, { allowOctetStream: true })).toMatchObject({ ok: false, transient: true, reason: expect.stringContaining('ETag') })
+    const truncated = new Headers(octet)
+    truncated.set('content-length', '400')
+    expect(await checkWebp(body, truncated, limits, { allowOctetStream: true })).toMatchObject({ ok: false, transient: true, reason: expect.stringContaining('annoncée') })
   })
 })
 
@@ -707,6 +843,196 @@ describe('logo d’extension', () => {
   })
 })
 
+// ——— Symbole ———
+
+describe('symbole d’extension', () => {
+  it('copie (servi en application/octet-stream, comme le vrai CDN) : « cards/fr/swsh3/_symbol.webp », validé, métadonnées ; logo intact', async () => {
+    const fake = new FakeTcgdex()
+    const body = webp(352, 41)
+    addSymbol(fake, `${SYMBOL}.webp`, body)
+    const clock = new Clock()
+    const deps = makeDeps(fake, clock)
+    await seedSet(clock, 'fr', 'swsh3', LOGO, { symbolUrl: SYMBOL })
+    await enqueueSymbol(clock, 'fr', 'swsh3')
+
+    expect(await tick(deps)).toMatchObject({ status: 'ran', done: 1, httpRequests: 1, bytesStored: 352 })
+    expect(fake.requests.map((request) => request.url)).toEqual([`${SYMBOL}.webp`])
+    expect(await r2Bytes(SYMBOL_KEY)).toEqual(body)
+    const head = await env.BUCKET.head(SYMBOL_KEY)
+    const sha256 = await sha256Hex(body)
+    // Stocké en image/webp (signature vérifiée), quel que soit le type générique servi par le CDN.
+    expect(head?.httpMetadata?.contentType).toBe('image/webp')
+    expect(head?.customMetadata).toEqual({ variant: 'symbol', language: 'fr', setId: 'swsh3', sourceUrl: `${SYMBOL}.webp`, sha256, md5: await md5Hex(body) })
+    expect(await symbolRow('fr:swsh3')).toEqual({
+      symbol_status: 'downloaded',
+      symbol_r2_key: SYMBOL_KEY,
+      symbol_source_url: `${SYMBOL}.webp`,
+      symbol_file_size: 352,
+      symbol_sha256: sha256,
+      symbol_checked_at: iso(clock.now()),
+      symbol_failure_reason: null,
+    })
+    expect(await jobByKey('symbol:fr:swsh3')).toMatchObject({ job_type: 'image', status: 'done', attempts: 1, priority: MEDIA_PRIORITY, payload_json: '{"media":"symbol"}' })
+    // Le logo de l'extension n'est pas touché ; seul le symbole est sous cards/.
+    expect(await logoRow('fr:swsh3')).toMatchObject({ logo_status: null, logo_r2_key: null })
+    expect(await r2Keys('cards/')).toEqual([SYMBOL_KEY])
+  })
+
+  it('404 : « not_found_on_cdn » avec l’URL testée, sans nouvelle tentative, aucun objet', async () => {
+    const fake = new FakeTcgdex()
+    const clock = new Clock()
+    const deps = makeDeps(fake, clock)
+    await seedSet(clock, 'fr', 'swsh3', null, { symbolUrl: SYMBOL })
+    await enqueueSymbol(clock, 'fr', 'swsh3')
+    await drain(deps, clock)
+
+    const row = await symbolRow('fr:swsh3')
+    expect(row).toMatchObject({ symbol_status: 'not_found_on_cdn', symbol_source_url: `${SYMBOL}.webp`, symbol_r2_key: null, symbol_file_size: null })
+    expect(row.symbol_failure_reason).toContain('symbole fr:swsh3 introuvable sur le CDN (HTTP 404)')
+    expect(fake.requests).toHaveLength(1)
+    expect(await jobByKey('symbol:fr:swsh3')).toMatchObject({ status: 'done', attempts: 1 })
+    expect(await r2Keys('cards/')).toEqual([])
+  })
+
+  it('fichier invalide : « invalid_image » (non WebP, ou type MIME autre que webp/octet-stream) ; symbole absent, d’une autre langue ou hors du CDN : « missing_api_url » sans requête', async () => {
+    const fake = new FakeTcgdex()
+    const png = new Uint8Array(300)
+    png.set([0x89, 0x50, 0x4e, 0x47])
+    addSymbol(fake, `${SYMBOL}.webp`, png)
+    const html = `${ASSETS}/univ/swsh/swsh4/symbol`
+    fake.addImage(`${html}.webp`, webp(352, 43), { headers: { 'content-type': 'text/html' } })
+    const clock = new Clock()
+    const deps = makeDeps(fake, clock)
+    await seedSet(clock, 'fr', 'swsh3', null, { symbolUrl: SYMBOL })
+    await seedSet(clock, 'fr', 'swsh4', null, { symbolUrl: html })
+    await seedSet(clock, 'fr', 'swsh5', null, { symbolUrl: `${ASSETS}/en/swsh/swsh5/symbol` })
+    await seedSet(clock, 'fr', 'swsh6', null, { symbolUrl: 'https://evil.example.com/univ/swsh/swsh6/symbol' })
+    await seedSet(clock, 'fr', 'swsh7', null)
+    for (const set of ['swsh3', 'swsh4', 'swsh5', 'swsh6', 'swsh7']) await enqueueSymbol(clock, 'fr', set)
+
+    await drain(deps, clock)
+    expect(await symbolRow('fr:swsh3')).toMatchObject({ symbol_status: 'invalid_image', symbol_r2_key: null })
+    expect((await symbolRow('fr:swsh3')).symbol_failure_reason).toContain('signature WebP absente')
+    expect(await symbolRow('fr:swsh4')).toMatchObject({ symbol_status: 'invalid_image', symbol_r2_key: null })
+    expect((await symbolRow('fr:swsh4')).symbol_failure_reason).toContain('type MIME inattendu : text/html')
+    for (const set of ['swsh5', 'swsh6']) {
+      const row = await symbolRow(`fr:${set}`)
+      expect(row.symbol_status, set).toBe('missing_api_url')
+      expect(row.symbol_failure_reason, set).toContain('URL de symbole refusée')
+    }
+    expect(await symbolRow('fr:swsh7')).toMatchObject({ symbol_status: 'missing_api_url', symbol_failure_reason: 'aucun symbole donné par l’API' })
+    expect(fake.requests.map((request) => request.url).sort()).toEqual([`${SYMBOL}.webp`, `${html}.webp`])
+    expect(await r2Keys('cards/')).toEqual([])
+  })
+
+  it('« application/octet-stream » accepté pour le symbole seulement : le même fichier refusé pour un logo et une petite image', async () => {
+    const fake = new FakeTcgdex()
+    addSymbol(fake, `${SYMBOL}.webp`, webp(352, 41))
+    addSymbol(fake, `${LOGO}.webp`, webp(500, 25))
+    addSymbol(fake, LOW_136, webp(120, 21))
+    const clock = new Clock()
+    const deps = makeDeps(fake, clock)
+    const { cardId } = await seedCard(clock)
+    await env.DB.prepare(`UPDATE sets SET logo_url = ?1, symbol_url = ?2 WHERE id = 'fr:swsh3'`).bind(LOGO, SYMBOL).run()
+    await enqueueSymbol(clock, 'fr', 'swsh3')
+    await enqueueLogo(clock, 'fr', 'swsh3')
+    await enqueueLow(clock, 'fr', 'swsh3-136')
+
+    await drain(deps, clock)
+    expect(await symbolRow('fr:swsh3')).toMatchObject({ symbol_status: 'downloaded', symbol_r2_key: SYMBOL_KEY })
+    const logo = await logoRow('fr:swsh3')
+    expect(logo.logo_status).toBe('invalid_image')
+    expect(logo.logo_failure_reason).toContain('type MIME inattendu : application/octet-stream')
+    const low = await lowRow(cardId)
+    expect(low.image_low_status).toBe('invalid_image')
+    expect(low.image_low_failure_reason).toContain('type MIME inattendu : application/octet-stream')
+    expect(await r2Keys('cards/')).toEqual([SYMBOL_KEY])
+    expect(fake.requests).toHaveLength(3)
+  })
+
+  it('transfert corrompu (MD5 ≠ ETag) malgré le type générique : nouvelle tentative, puis « download_error », jamais d’objet', async () => {
+    const fake = new FakeTcgdex()
+    const corrupt = () => imageResponse(webp(352, 41), { 'content-type': 'application/octet-stream', etag: '"00112233445566778899aabbccddeeff"' })
+    fake.queue(`${SYMBOL}.webp`, corrupt, corrupt)
+    const clock = new Clock()
+    const deps = makeDeps(fake, clock, { MAX_ATTEMPTS: '2' })
+    await seedSet(clock, 'fr', 'swsh3', null, { symbolUrl: SYMBOL })
+    await enqueueSymbol(clock, 'fr', 'swsh3', 2)
+
+    expect(await tick(deps)).toMatchObject({ status: 'ran', retried: 1, done: 0 })
+    expect(await jobByKey('symbol:fr:swsh3')).toMatchObject({ status: 'pending', attempts: 1 })
+    expect((await symbolRow('fr:swsh3')).symbol_status).toBeNull()
+
+    await drain(deps, clock)
+    expect(await jobByKey('symbol:fr:swsh3')).toMatchObject({ status: 'failed', attempts: 2 })
+    const row = await symbolRow('fr:swsh3')
+    expect(row.symbol_status).toBe('download_error')
+    expect(row.symbol_failure_reason).toContain('ETag')
+    expect(fake.requests).toHaveLength(2)
+    expect(await env.BUCKET.head(SYMBOL_KEY)).toBeNull()
+  })
+
+  it('symbole déjà présent dans R2 : réconcilié sans téléchargement ; déjà enregistré : aucune requête, rien de réécrit (idempotence)', async () => {
+    const fake = new FakeTcgdex()
+    addSymbol(fake, `${SYMBOL}.webp`, webp(352, 41))
+    const clock = new Clock()
+    const deps = makeDeps(fake, clock)
+    await seedSet(clock, 'fr', 'swsh3', null, { symbolUrl: SYMBOL })
+    const body = webp(340, 44)
+    const sha256 = await sha256Hex(body)
+    await env.BUCKET.put(SYMBOL_KEY, body, { customMetadata: { sha256, setId: 'swsh3', variant: 'symbol' } })
+    const uploaded = (await env.BUCKET.head(SYMBOL_KEY))?.uploaded.toISOString()
+    await enqueueSymbol(clock, 'fr', 'swsh3')
+
+    expect(await tick(deps)).toMatchObject({ done: 1, httpRequests: 0, bytesStored: 0 })
+    expect(await symbolRow('fr:swsh3')).toMatchObject({ symbol_status: 'downloaded', symbol_r2_key: SYMBOL_KEY, symbol_file_size: 340, symbol_sha256: sha256 })
+    expect(await r2Bytes(SYMBOL_KEY)).toEqual(body)
+    expect((await env.BUCKET.head(SYMBOL_KEY))?.uploaded.toISOString()).toBe(uploaded)
+
+    // Relancée : rien à faire, la ligne de l'extension n'est pas réécrite.
+    const before = await one(`SELECT * FROM sets WHERE id = 'fr:swsh3'`)
+    clock.advance(MIN)
+    await enqueueSymbol(clock, 'fr', 'swsh3')
+    expect(await tick(deps)).toMatchObject({ done: 1, httpRequests: 0 })
+    expect(await one(`SELECT * FROM sets WHERE id = 'fr:swsh3'`)).toEqual(before)
+    expect(fake.requests).toHaveLength(0)
+  })
+
+  it('objet valide d’une autre extension à la même clé : jamais écrasé, échec enregistré, aucune requête', async () => {
+    const fake = new FakeTcgdex()
+    addSymbol(fake, `${SYMBOL}.webp`, webp(352, 41))
+    const clock = new Clock()
+    const deps = makeDeps(fake, clock)
+    await seedSet(clock, 'fr', 'swsh3', null, { symbolUrl: SYMBOL })
+    const foreign = webp(380, 45)
+    await env.BUCKET.put(SYMBOL_KEY, foreign, { customMetadata: { sha256: await sha256Hex(foreign), setId: 'autre-extension', variant: 'symbol' } })
+    await enqueueSymbol(clock, 'fr', 'swsh3')
+
+    expect(await tick(deps)).toMatchObject({ status: 'ran', done: 1, httpRequests: 0 })
+    const row = await symbolRow('fr:swsh3')
+    expect(row).toMatchObject({ symbol_status: 'download_error', symbol_r2_key: null })
+    expect(row.symbol_failure_reason).toContain('jamais écrasé')
+    expect(await r2Bytes(SYMBOL_KEY)).toEqual(foreign)
+    expect(fake.requests).toHaveLength(0)
+  })
+
+  it('verrou expiré après la dernière tentative : symbole en « download_error », logo intact', async () => {
+    const fake = new FakeTcgdex()
+    const clock = new Clock()
+    const deps = makeDeps(fake, clock, { MAX_ATTEMPTS: '1' })
+    await seedSet(clock, 'fr', 'swsh3', LOGO, { symbolUrl: SYMBOL, logoStatus: 'downloaded', logoKey: LOGO_KEY, logoSize: 500 })
+    await enqueueSymbol(clock, 'fr', 'swsh3', 1)
+    expect(await claimJobs(db(), { limit: 10, token: 'execution-morte', nowMs: clock.now(), leaseMs: deps.config.jobLeaseMs })).toHaveLength(1)
+
+    clock.advance(deps.config.jobLeaseMs + 1)
+    await tick(deps)
+    expect(await symbolRow('fr:swsh3')).toMatchObject({ symbol_status: 'download_error', symbol_failure_reason: 'verrou expiré : nombre maximal de tentatives atteint' })
+    expect(await logoRow('fr:swsh3')).toMatchObject({ logo_status: 'downloaded', logo_r2_key: LOGO_KEY, logo_failure_reason: null })
+    expect(await jobByKey('symbol:fr:swsh3')).toMatchObject({ status: 'failed' })
+    expect(fake.requests).toHaveLength(0)
+  })
+})
+
 // ——— Création des tâches par la synchronisation ———
 
 describe('tâches créées par la tâche « set »', () => {
@@ -882,6 +1208,91 @@ describe('tâches créées par la tâche « set »', () => {
     expect(fake.count((url) => url.endsWith('logo-v3.webp'))).toBe(0)
     expect(await r2Bytes(LOGO_KEY)).toEqual(webp(480, 28))
   })
+
+  it('symboles : copiés à l’import (FR sous univ, JA) en dernière priorité, rattachés à la synchronisation ; la synchronisation suivante ne recrée ni ne retélécharge rien', async () => {
+    const fake = catalogWithSymbols()
+    const clock = new Clock()
+    const deps = makeDeps(fake, clock)
+    const started = await startSync(db(), deps.config, clock.now())
+    const runIds = Object.fromEntries(started.started.map((run) => [run.language, run.runId]))
+    expect((await drain(deps, clock)).at(-1)?.status).toBe('idle')
+
+    expect(await r2Bytes(SYMBOL_KEY)).toEqual(webp(352, 41))
+    expect(await r2Bytes(SYMBOL_KEY_JA)).toEqual(webp(360, 42))
+    expect(await rows(`SELECT id, symbol_status, symbol_r2_key, symbol_source_url FROM sets ORDER BY id`)).toEqual([
+      { id: 'fr:exu', symbol_status: null, symbol_r2_key: null, symbol_source_url: null },
+      { id: 'fr:swsh3', symbol_status: 'downloaded', symbol_r2_key: SYMBOL_KEY, symbol_source_url: `${SYMBOL}.webp` },
+      { id: 'ja:SM1+', symbol_status: null, symbol_r2_key: null, symbol_source_url: null },
+      { id: 'ja:SV1a', symbol_status: 'downloaded', symbol_r2_key: SYMBOL_KEY_JA, symbol_source_url: `${SYMBOL_JA}.webp` },
+    ])
+    // Logo et petites images inchangés par l'ajout des symboles.
+    expect(await logoRow('fr:swsh3')).toMatchObject({ logo_status: 'downloaded', logo_r2_key: LOGO_KEY })
+    expect((await one<{ n: number }>(`SELECT COUNT(*) AS n FROM cards WHERE image_low_status = 'downloaded'`)).n).toBe(4)
+
+    // Une tâche par extension qui a un symbole, et seulement elles ; priorité la plus basse, synchronisation de sa langue.
+    const jobs = await rows<{ dedupe_key: string; language: string; job_type: string; priority: number; run_id: number; status: string; payload_json: string }>(
+      `SELECT dedupe_key, language, job_type, priority, run_id, status, payload_json FROM import_jobs WHERE dedupe_key LIKE 'symbol:%' ORDER BY dedupe_key`,
+    )
+    expect(jobs.map((job) => job.dedupe_key)).toEqual(['symbol:fr:swsh3', 'symbol:ja:SV1a'])
+    for (const job of jobs) {
+      expect(job, job.dedupe_key).toMatchObject({ job_type: 'image', priority: MEDIA_PRIORITY, status: 'done', run_id: runIds[job.language], payload_json: '{"media":"symbol"}' })
+    }
+    expect(fake.count((url) => url.endsWith('/symbol.webp'))).toBe(2)
+    const summary = JSON.parse(await ((await env.BUCKET.get('reports/latest/summary.json')) as R2ObjectBody).text()) as { audit: Record<string, number> }
+    expect(summary.audit).toMatchObject({ r2Objects: 11, unknownObjects: 0, lowImageObjects: 4, logoObjects: 1, symbolObjects: 2, mediaReconciled: 0, mediaMissingObjects: 0 })
+
+    // Synchronisation hebdomadaire : rien de retéléchargé, aucune nouvelle tâche, extensions inchangées.
+    const setsBefore = await rows(`SELECT * FROM sets ORDER BY id`)
+    const jobsBefore = (await one<{ n: number }>(`SELECT COUNT(*) AS n FROM import_jobs`)).n
+    const webpRequests = fake.count((url) => url.endsWith('.webp'))
+    clock.advance(7 * DAY)
+    await startSync(db(), deps.config, clock.now(), { kind: 'weekly' })
+    await drain(deps, clock)
+    expect(fake.count((url) => url.endsWith('.webp'))).toBe(webpRequests)
+    expect((await one<{ n: number }>(`SELECT COUNT(*) AS n FROM import_jobs`)).n).toBe(jobsBefore)
+    expect(await rows(`SELECT * FROM sets ORDER BY id`)).toEqual(setsBefore)
+    expect(await rows(`SELECT status FROM import_jobs WHERE dedupe_key LIKE 'symbol:%'`)).toEqual([{ status: 'done' }, { status: 'done' }])
+  })
+
+  it('symbole absent : revérifié seulement après MISSING_RECHECK_DAYS, tout de suite si l’URL change ; un symbole copié n’est jamais remplacé', async () => {
+    const fake = sampleCatalog()
+    const swsh3 = fake.sets.fr.find((set) => set.id === 'swsh3')
+    if (!swsh3) throw new Error('catalogue de référence inattendu')
+    swsh3.symbol = SYMBOL
+    const clock = new Clock()
+    const deps = makeDeps(fake, clock)
+    const weekly = async (days: number) => {
+      clock.advance(days * DAY)
+      await startSync(db(), deps.config, clock.now(), { kind: 'weekly', languages: ['fr'] })
+      await drain(deps, clock)
+    }
+    await startSync(db(), deps.config, clock.now(), { languages: ['fr'] })
+    await drain(deps, clock)
+    expect(await symbolRow('fr:swsh3')).toMatchObject({ symbol_status: 'not_found_on_cdn', symbol_source_url: `${SYMBOL}.webp` })
+    expect(fake.count((url) => url === `${SYMBOL}.webp`)).toBe(1)
+
+    // Même URL : pas de nouvelle requête avant 30 jours, puis une seule.
+    await weekly(7)
+    await weekly(21)
+    expect(fake.count((url) => url === `${SYMBOL}.webp`)).toBe(1)
+    await weekly(7)
+    expect(fake.count((url) => url === `${SYMBOL}.webp`)).toBe(2)
+    expect((await symbolRow('fr:swsh3')).symbol_status).toBe('not_found_on_cdn')
+
+    // Nouvelle URL de symbole : revérifiée sans attendre 30 jours.
+    swsh3.symbol = `${ASSETS}/univ/swsh/swsh3/symbol-v2`
+    addSymbol(fake, `${swsh3.symbol}.webp`, webp(352, 46))
+    await weekly(7)
+    expect(await symbolRow('fr:swsh3')).toMatchObject({ symbol_status: 'downloaded', symbol_r2_key: SYMBOL_KEY, symbol_source_url: `${ASSETS}/univ/swsh/swsh3/symbol-v2.webp`, symbol_file_size: 352 })
+
+    // Symbole copié : une URL encore différente ne le remplace jamais.
+    swsh3.symbol = `${ASSETS}/univ/swsh/swsh3/symbol-v3`
+    addSymbol(fake, `${swsh3.symbol}.webp`, webp(360, 47))
+    await weekly(7)
+    expect(fake.count((url) => url.endsWith('symbol-v3.webp'))).toBe(0)
+    expect(await r2Bytes(SYMBOL_KEY)).toEqual(webp(352, 46))
+    expect(await rows(`SELECT dedupe_key FROM import_jobs WHERE dedupe_key LIKE 'symbol:%'`)).toEqual([{ dedupe_key: 'symbol:fr:swsh3' }])
+  })
 })
 
 // ——— Rattrapage par l'administration ———
@@ -938,6 +1349,60 @@ describe('POST /admin/sync/backfill-media', () => {
     expect((await one<{ n: number }>(`SELECT COUNT(*) AS n FROM import_jobs`)).n).toBe(7)
   })
 
+  it('symboles : une tâche par symbole manquant (même règle que les logos), « symbols » dans la réponse ; rappeler la route ne crée rien de plus ; puis copiés', async () => {
+    const fake = new FakeTcgdex()
+    const clock = new Clock()
+    const deps = makeDeps(fake, clock)
+    const old = iso(clock.now() - 31 * DAY)
+    const recent = iso(clock.now() - 2 * DAY)
+    const url = (set: string, name = 'symbol') => `${ASSETS}/univ/swsh/${set}/${name}`
+    await seedSet(clock, 'fr', 'swsh1', null, { symbolUrl: url('swsh1') }) // jamais traité → oui
+    await seedSet(clock, 'fr', 'swsh2', null, { symbolUrl: url('swsh2'), symbolStatus: 'downloaded', symbolKey: 'cards/fr/swsh2/_symbol.webp', symbolCheckedAt: recent }) // copié → non
+    await seedSet(clock, 'fr', 'swsh3', null, { symbolUrl: url('swsh3'), symbolStatus: 'not_found_on_cdn', symbolCheckedAt: recent, symbolSourceUrl: `${url('swsh3')}.webp` }) // absent récemment → non
+    await seedSet(clock, 'fr', 'swsh4', null, { symbolUrl: url('swsh4'), symbolStatus: 'not_found_on_cdn', symbolCheckedAt: old, symbolSourceUrl: `${url('swsh4')}.webp` }) // absent depuis > 30 j → oui
+    await seedSet(clock, 'fr', 'swsh5', null, { symbolUrl: url('swsh5'), symbolStatus: 'download_error', symbolCheckedAt: old, symbolSourceUrl: `${url('swsh5')}.webp` }) // en erreur depuis > 30 j → oui
+    await seedSet(clock, 'fr', 'swsh6', null, { symbolUrl: url('swsh6', 'symbol-v2'), symbolStatus: 'not_found_on_cdn', symbolCheckedAt: recent, symbolSourceUrl: `${url('swsh6')}.webp` }) // URL changée → oui
+    await seedSet(clock, 'fr', 'swsh7', null) // pas de symbole → non
+    await seedSet(clock, 'fr', 'swsh8', null, { symbolUrl: url('swsh8') }) // déjà une tâche active → non
+    await enqueueSymbol(clock, 'fr', 'swsh8')
+    await seedSet(clock, 'ja', 'SV1a', null, { symbolUrl: SYMBOL_JA }) // oui (JA)
+
+    const fr = await admin(deps, fake, 'POST', '/admin/sync/backfill-media?language=fr')
+    expect(fr.status).toBe(200)
+    expect(await fr.json()).toMatchObject({ lowImages: 0, logos: 0, symbols: 4, complete: true })
+    const created = await rows<{ dedupe_key: string; job_type: string; priority: number; run_id: number | null; payload_json: string; status: string }>(
+      `SELECT dedupe_key, job_type, priority, run_id, payload_json, status FROM import_jobs ORDER BY dedupe_key`,
+    )
+    expect(created.map((job) => job.dedupe_key)).toEqual(['symbol:fr:swsh1', 'symbol:fr:swsh4', 'symbol:fr:swsh5', 'symbol:fr:swsh6', 'symbol:fr:swsh8'])
+    for (const job of created) {
+      expect(job, job.dedupe_key).toMatchObject({ job_type: 'image', priority: MEDIA_PRIORITY, run_id: null, payload_json: '{"media":"symbol"}', status: 'pending' })
+    }
+
+    // Toutes langues (par défaut) : seule l'extension japonaise reste ; puis plus rien.
+    expect(await (await admin(deps, fake, 'POST', '/admin/sync/backfill-media')).json()).toMatchObject({ lowImages: 0, logos: 0, symbols: 1, complete: true })
+    expect(await (await admin(deps, fake, 'POST', '/admin/sync/backfill-media')).json()).toMatchObject({ lowImages: 0, logos: 0, symbols: 0, complete: true })
+    expect((await one<{ n: number }>(`SELECT COUNT(*) AS n FROM import_jobs`)).n).toBe(6)
+
+    // Exécution : symboles présents sur le CDN copiés (servis en octet-stream), les autres introuvables.
+    addSymbol(fake, `${url('swsh1')}.webp`, webp(352, 48))
+    addSymbol(fake, `${SYMBOL_JA}.webp`, webp(360, 42))
+    await drain(deps, clock)
+    expect(await rows(`SELECT id, symbol_status FROM sets ORDER BY id`)).toEqual([
+      { id: 'fr:swsh1', symbol_status: 'downloaded' },
+      { id: 'fr:swsh2', symbol_status: 'downloaded' },
+      { id: 'fr:swsh3', symbol_status: 'not_found_on_cdn' },
+      { id: 'fr:swsh4', symbol_status: 'not_found_on_cdn' },
+      { id: 'fr:swsh5', symbol_status: 'not_found_on_cdn' },
+      { id: 'fr:swsh6', symbol_status: 'not_found_on_cdn' },
+      { id: 'fr:swsh7', symbol_status: null },
+      { id: 'fr:swsh8', symbol_status: 'not_found_on_cdn' },
+      { id: 'ja:SV1a', symbol_status: 'downloaded' },
+    ])
+    expect(await r2Keys('cards/')).toEqual(['cards/fr/swsh1/_symbol.webp', SYMBOL_KEY_JA])
+    expect(fake.count((request) => request.endsWith('.webp'))).toBe(6)
+    expect(await (await admin(deps, fake, 'POST', '/admin/sync/backfill-media')).json()).toMatchObject({ lowImages: 0, logos: 0, symbols: 0, complete: true })
+  })
+
   it('rattrapage par pages (plus de 500 cartes), puis exécution : tout est copié, et la route ne trouve plus rien', async () => {
     const fake = new FakeTcgdex()
     const clock = new Clock()
@@ -974,14 +1439,14 @@ describe('POST /admin/sync/backfill-media', () => {
 // ——— Priorités ———
 
 describe('priorités', () => {
-  it('petites images et logos passent après catalogue, extensions, index, rapport, images principales et détails', async () => {
+  it('petites images, logos et symboles passent après catalogue, extensions, index, rapport, images principales et détails', async () => {
     expect(MEDIA_PRIORITY).toBeGreaterThan(Math.max(...Object.values(JOB_PRIORITY)))
     const clock = new Clock()
     const database = db()
     const opts = { runId: null, maxAttempts: 5, nowMs: clock.now() }
     // Créées dans l'ordre inverse de leur priorité.
     await database.batch([
-      ...enqueueMediaStmts(database, 'fr', [logoJob('fr', 'swsh3'), lowImageJob('fr', 'swsh3-136')], opts),
+      ...enqueueMediaStmts(database, 'fr', [logoJob('fr', 'swsh3'), lowImageJob('fr', 'swsh3-136'), symbolJob('fr', 'swsh3')], opts),
       ...enqueueStmts(database, 'card', 'fr', [{ target: 'swsh3-136', cardId: 'fr:swsh3-136', dedupeKey: 'card:fr:swsh3-136' }], opts),
       ...enqueueStmts(database, 'image', 'fr', [imageJob('fr', 'swsh3-136')], opts),
       ...enqueueStmts(database, 'report', null, [{ target: null, cardId: null, dedupeKey: 'report:*:*' }], opts),
@@ -990,12 +1455,12 @@ describe('priorités', () => {
       ...enqueueStmts(database, 'catalog', 'fr', [{ target: null, cardId: null, dedupeKey: 'catalog:fr:*' }], opts),
     ])
     const order: string[] = []
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 10; i++) {
       const [claimed] = await claimJobs(database, { limit: 1, token: `t${i}`, nowMs: clock.now(), leaseMs: MIN })
       if (!claimed) break
       order.push(`${claimed.job_type}:${claimed.priority}:${mediaKind(claimed) ?? '-'}`)
     }
-    expect(order).toEqual(['catalog:0:-', 'set:1:-', 'card_index:2:-', 'report:3:-', 'image:4:-', 'card:5:-', 'image:6:logo', 'image:6:low'])
+    expect(order).toEqual(['catalog:0:-', 'set:1:-', 'card_index:2:-', 'report:3:-', 'image:4:-', 'card:5:-', 'image:6:logo', 'image:6:low', 'image:6:symbol'])
   })
 })
 
@@ -1056,6 +1521,45 @@ describe('plafonds de coût', () => {
     await env.DB.prepare(`INSERT INTO runtime_state (key, value, updated_at) VALUES ('ops:2026-11-13', '100', ?1)`).bind(iso(clock.now())).run()
     expect(await tick(deps)).toMatchObject({ status: 'skipped', claimed: 0 })
     expect(fake.requests).toHaveLength(0)
+  })
+
+  it('symboles : comptés dans storedBytes (copiés seulement) ; MAX_STORED_BYTES atteint par eux : pause automatique, aucune requête', async () => {
+    const fake = new FakeTcgdex()
+    addSymbol(fake, `${SYMBOL}.webp`, webp(352, 41))
+    const clock = new Clock()
+    await seedSet(clock, 'fr', 'swsh4', LOGO, { logoStatus: 'downloaded', logoKey: 'cards/fr/swsh4/_logo.webp', logoSize: 500, symbolUrl: SYMBOL, symbolStatus: 'downloaded', symbolKey: 'cards/fr/swsh4/_symbol.webp', symbolSize: 352 })
+    await seedSet(clock, 'fr', 'swsh5', null, { symbolUrl: SYMBOL, symbolStatus: 'not_found_on_cdn', symbolSize: 999 })
+    expect(await storedBytes(db())).toBe(500 + 352)
+
+    await seedSet(clock, 'fr', 'big', null, { symbolUrl: SYMBOL, symbolStatus: 'downloaded', symbolKey: 'cards/fr/big/_symbol.webp', symbolSize: 999_148 })
+    await seedSet(clock, 'fr', 'swsh3', null, { symbolUrl: SYMBOL })
+    await enqueueSymbol(clock, 'fr', 'swsh3')
+    const deps = makeDeps(fake, clock, { MAX_STORED_BYTES: '1000000' })
+    expect(await tick(deps)).toMatchObject({ status: 'skipped', reason: 'plafond de stockage atteint (1000000 octets) : pause automatique', claimed: 0 })
+    expect(fake.requests).toHaveLength(0)
+    expect(await one(`SELECT value FROM runtime_state WHERE key = 'paused'`)).toEqual({ value: '1' })
+  })
+
+  it('symboles : la requête et l’écriture R2 comptent dans les opérations du jour ; plafond atteint : aucun symbole ne part', async () => {
+    const fake = new FakeTcgdex()
+    addSymbol(fake, `${SYMBOL}.webp`, webp(352, 41))
+    const clock = new Clock()
+    const deps = makeDeps(fake, clock)
+    await seedSet(clock, 'fr', 'swsh3', null, { symbolUrl: SYMBOL })
+    await enqueueSymbol(clock, 'fr', 'swsh3')
+    expect(await tick(deps)).toMatchObject({ done: 1, httpRequests: 1, bytesStored: 352 })
+    expect(await one(`SELECT value FROM runtime_state WHERE key = 'ops:2026-11-13'`)).toEqual({ value: '2' })
+    expect(await one(`SELECT http_requests, bytes_stored FROM tick_runs`)).toEqual({ http_requests: 1, bytes_stored: 352 })
+
+    const other = `${ASSETS}/univ/swsh/swsh4/symbol`
+    addSymbol(fake, `${other}.webp`, webp(352, 49))
+    await seedSet(clock, 'fr', 'swsh4', null, { symbolUrl: other })
+    await enqueueSymbol(clock, 'fr', 'swsh4')
+    await env.DB.prepare(`UPDATE runtime_state SET value = '100' WHERE key = 'ops:2026-11-13'`).run()
+    clock.advance(5 * MIN)
+    expect(await tick(makeDeps(fake, clock, { MAX_DAILY_OPERATIONS: '100' }))).toMatchObject({ status: 'skipped', claimed: 0 })
+    expect(fake.requests).toHaveLength(1)
+    expect((await symbolRow('fr:swsh4')).symbol_status).toBeNull()
   })
 })
 
@@ -1131,6 +1635,67 @@ describe('statut, erreurs et audit', () => {
     // Seuls les deux objets disparus ont été retéléchargés (136 réconciliée sans requête).
     expect(fake.count((url) => url.endsWith('.webp'))).toBe(requests + 2)
   })
+
+  it('GET /admin/status (texte et JSON) : symboles par langue et au total, comptés dans le volume ; tâches « symbol » à part', async () => {
+    const fake = catalogWithSymbols()
+    fake.images.delete(`${SYMBOL_JA}.webp`)
+    const clock = new Clock()
+    const deps = makeDeps(fake, clock)
+    await startSync(db(), deps.config, clock.now())
+    await drain(deps, clock)
+
+    const stats = (await (await admin(deps, fake, 'GET', '/admin/status?format=json')).json()) as Stats
+    expect(stats.languages[0]).toMatchObject({ language: 'fr', setsWithSymbol: 1, symbolsStored: 1, symbolsMissing: 0, symbolsErrors: 0, symbolsPending: 0, symbolBytes: 352 })
+    expect(stats.languages[1]).toMatchObject({ language: 'ja', setsWithSymbol: 1, symbolsStored: 0, symbolsMissing: 1, symbolsErrors: 0, symbolsPending: 0, symbolBytes: 0 })
+    // Images principales 1 260 ; petites images 250 (FR) + 290 (JA) ; logo 500 ; symbole 352.
+    expect(stats.total).toMatchObject({ bytes: 1260, symbolsStored: 1, mediaBytes: 250 + 290 + 500 + 352, storedBytes: 1260 + 250 + 290 + 500 + 352 })
+    expect(stats.total.storedBytes).toBe(await storedBytes(db()))
+    expect(stats.jobs.filter((job) => job.job_type === 'symbol')).toEqual([{ job_type: 'symbol', status: 'done', n: 2 }])
+
+    const text = await (await admin(deps, fake, 'GET', '/admin/status')).text()
+    const sections = new Map(text.trimEnd().split('\n\n').map((block) => [block.split('\n')[0] ?? '', block]))
+    expect(sections.get('FRANÇAIS')).toMatch(/^Symboles d’extension\s*: 1 \/ 1 \(introuvables 0, erreurs 0, à faire 0\)$/m)
+    expect(sections.get('JAPONAIS')).toMatch(/^Symboles d’extension\s*: 0 \/ 1 \(introuvables 1, erreurs 0, à faire 0\)$/m)
+    expect(sections.get('TOTAL')).toMatch(/^Symboles R2\s*: 1$/m)
+  })
+
+  it('GET /admin/errors : une tâche de symbole en échec est signalée comme « symbol »', async () => {
+    const fake = new FakeTcgdex()
+    fake.images.set(`${SYMBOL}.webp`, { status: 500 })
+    const clock = new Clock()
+    const deps = makeDeps(fake, clock, { MAX_ATTEMPTS: '1' })
+    await seedSet(clock, 'fr', 'swsh3', null, { symbolUrl: SYMBOL })
+    await enqueueSymbol(clock, 'fr', 'swsh3', 1)
+    await tick(deps)
+    const errors = (await (await admin(deps, fake, 'GET', '/admin/errors')).json()) as { failedJobs: { job_type: string; target_id: string; last_error: string }[] }
+    expect(errors.failedJobs).toEqual([expect.objectContaining({ job_type: 'symbol', target_id: 'swsh3' })])
+    expect(errors.failedJobs[0]?.last_error).toContain('HTTP 500')
+    expect(await symbolRow('fr:swsh3')).toMatchObject({ symbol_status: 'download_error', symbol_r2_key: null })
+  })
+
+  it('audit : objet de symbole présent mais non enregistré → réconcilié sans requête ; enregistré mais disparu → recopié', async () => {
+    const fake = catalogWithSymbols()
+    const clock = new Clock()
+    const deps = makeDeps(fake, clock, { MIN_REQUEST_INTERVAL_MS: '50' })
+    await startSync(db(), deps.config, clock.now())
+    await drain(deps, clock)
+    // Le symbole FR a disparu de R2 ; D1 a « oublié » le symbole JA (objet présent).
+    await env.BUCKET.delete(SYMBOL_KEY)
+    await env.DB.prepare(`UPDATE sets SET symbol_status = NULL, symbol_r2_key = NULL WHERE id = 'ja:SV1a'`).run()
+    const requests = fake.count((url) => url.endsWith('/symbol.webp'))
+
+    clock.advance(MIN)
+    expect((await admin(deps, fake, 'POST', '/admin/reports/generate')).status).toBe(200)
+    await drain(deps, clock)
+    const summary = JSON.parse(await ((await env.BUCKET.get('reports/latest/summary.json')) as R2ObjectBody).text()) as { audit: Record<string, number> }
+    expect(summary.audit).toMatchObject({ unknownObjects: 0, lowImageObjects: 4, logoObjects: 1, symbolObjects: 1, mediaReconciled: 1, mediaMissingObjects: 1 })
+
+    expect(await symbolRow('fr:swsh3')).toMatchObject({ symbol_status: 'downloaded', symbol_r2_key: SYMBOL_KEY, symbol_source_url: `${SYMBOL}.webp` })
+    expect(await symbolRow('ja:SV1a')).toMatchObject({ symbol_status: 'downloaded', symbol_r2_key: SYMBOL_KEY_JA, symbol_source_url: `${SYMBOL_JA}.webp` })
+    expect(await r2Bytes(SYMBOL_KEY)).toEqual(webp(352, 41))
+    // Seul le symbole disparu a été retéléchargé (le japonais réconcilié sans requête).
+    expect(fake.count((url) => url.endsWith('/symbol.webp'))).toBe(requests + 1)
+  })
 })
 
 // ——— Schéma ———
@@ -1152,6 +1717,45 @@ describe('schéma (migration 0002)', () => {
     // La contrainte CHECK de import_jobs.job_type est intacte (aucun nouveau type).
     await expect(
       env.DB.prepare(`INSERT INTO import_jobs (job_type, dedupe_key, priority, max_attempts, next_attempt_at, created_at, updated_at) VALUES ('logo', 'x', 6, 1, ?1, ?1, ?1)`)
+        .bind(iso(clock.now()))
+        .run(),
+    ).rejects.toThrow(/CHECK constraint failed/)
+  })
+})
+
+describe('schéma (migration 0003)', () => {
+  it('colonnes symbol_* ajoutées à sets, nulles par défaut ; même vocabulaire que logo_status ; import_jobs.job_type intact', async () => {
+    const clock = new Clock()
+    await seedSet(clock, 'fr', 'swsh3', LOGO, { symbolUrl: SYMBOL })
+    expect(await symbolRow('fr:swsh3')).toEqual({
+      symbol_status: null,
+      symbol_r2_key: null,
+      symbol_source_url: null,
+      symbol_file_size: null,
+      symbol_sha256: null,
+      symbol_checked_at: null,
+      symbol_failure_reason: null,
+    })
+    type Column = { name: string; type: string; notnull: number; dflt_value: string | null }
+    const added = (await rows<Column>(`PRAGMA table_info(sets)`)).filter((column) => column.name.startsWith('symbol_') && column.name !== 'symbol_url')
+    expect(added.map((column) => [column.name, column.type, column.notnull, column.dflt_value])).toEqual([
+      ['symbol_status', 'TEXT', 0, null],
+      ['symbol_r2_key', 'TEXT', 0, null],
+      ['symbol_checked_at', 'TEXT', 0, null],
+      ['symbol_source_url', 'TEXT', 0, null],
+      ['symbol_file_size', 'INTEGER', 0, null],
+      ['symbol_sha256', 'TEXT', 0, null],
+      ['symbol_failure_reason', 'TEXT', 0, null],
+    ])
+    for (const status of ['downloaded', 'not_found_on_cdn', 'missing_api_url', 'download_error', 'invalid_image', null]) {
+      await env.DB.prepare(`UPDATE sets SET symbol_status = ?1 WHERE id = 'fr:swsh3'`).bind(status).run()
+    }
+    for (const status of ['already_present', 'recovered_from_cdn', 'pending', 'présent']) {
+      await expect(env.DB.prepare(`UPDATE sets SET symbol_status = ?1 WHERE id = 'fr:swsh3'`).bind(status).run(), status).rejects.toThrow(/CHECK constraint failed/)
+    }
+    // Aucun nouveau type de tâche : les symboles sont des tâches `image`.
+    await expect(
+      env.DB.prepare(`INSERT INTO import_jobs (job_type, dedupe_key, priority, max_attempts, next_attempt_at, created_at, updated_at) VALUES ('symbol', 'x', 6, 1, ?1, ?1, ?1)`)
         .bind(iso(clock.now()))
         .run(),
     ).rejects.toThrow(/CHECK constraint failed/)

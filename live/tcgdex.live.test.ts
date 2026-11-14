@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest'
 import { parseConfig, type ConfigSource } from '../src/config'
 import { Usage } from '../src/db'
 import { Health, TcgdexClient } from '../src/tcgdex/client'
-import { checkWebp, imageCandidates, logoImageUrl, lowImageUrl } from '../src/tcgdex/images'
+import { checkWebp, imageCandidates, logoImageUrl, lowImageUrl, symbolImageUrl } from '../src/tcgdex/images'
 import { parseCardDetail, parseCardList, parseSeriesList, parseSetDetail, parseSetList } from '../src/tcgdex/types'
 import { readCapped } from '../src/utils/http'
 import { RateLimiter } from '../src/utils/limiter'
@@ -98,5 +98,17 @@ describe('TCGdex réel', () => {
     const logo = await image(logoUrl ?? '')
     expect(logo.status).toBe(200)
     expect(logo.check?.ok).toBe(true)
+  })
+
+  it('symbole d’extension (<symbol>.webp sous univ, servi en application/octet-stream)', async () => {
+    const url = symbolImageUrl('https://assets.tcgdex.net/univ/sv/sv03.5/symbol', 'fr')
+    expect(url).toBe('https://assets.tcgdex.net/univ/sv/sv03.5/symbol.webp')
+    const outcome = await client.get(url ?? '', 'image/webp')
+    if (outcome.kind !== 'ok') throw new Error(`${url} → ${outcome.kind} ${outcome.status}`)
+    // Si TCGdex sert un jour image/webp, l'exception `allowOctetStream` des symboles pourra être retirée.
+    expect(outcome.response.headers.get('content-type')).toBe('application/octet-stream')
+    const bytes = await readCapped(outcome.response, config.maxImageBytes)
+    expect((await checkWebp(bytes, outcome.response.headers, config, { allowOctetStream: true })).ok).toBe(true)
+    expect((await checkWebp(bytes, outcome.response.headers, config)).ok).toBe(false)
   })
 })

@@ -93,23 +93,42 @@ export const isLowQualitySource = (sourceUrl: string | null, quality: string | n
   quality === 'low' || (sourceUrl ?? '').endsWith('/low.webp')
 
 /**
- * URL du logo d'une extension : `<logo>.webp`, seulement en https sur le CDN de TCGdex, sans requête
- * ni fragment, et dans la langue de l'extension ou dans `univ` (ressources communes) : un logo d'une
- * autre langue n'est jamais copié. `null` sinon.
+ * URL d'une image d'extension (logo ou symbole) : `<url>.webp`, seulement en https sur le CDN de
+ * TCGdex, sans requête ni fragment, et dans la langue de l'extension ou dans `univ` (ressources
+ * communes) : une image d'une autre langue n'est jamais copiée. `null` sinon.
  */
-export function logoImageUrl(logoUrl: string | null, language: Language): string | null {
-  if (!logoUrl || logoUrl.includes('?') || logoUrl.includes('#') || !logoUrl.startsWith(`${ASSETS_BASE}/`)) return null
+function setAssetWebpUrl(baseUrl: string | null, language: Language): string | null {
+  if (!baseUrl || baseUrl.includes('?') || baseUrl.includes('#') || !baseUrl.startsWith(`${ASSETS_BASE}/`)) return null
   // Un segment « . » ou « .. » (même écrit %2e) serait normalisé par fetch vers une autre ressource.
-  const segments = logoUrl.slice(ASSETS_BASE.length + 1).split('/')
+  const segments = baseUrl.slice(ASSETS_BASE.length + 1).split('/')
   if (segments.some((part) => ['', '.', '..'].includes(part.replace(/%2e/gi, '.')))) return null
   if (segments[0] !== language && segments[0] !== 'univ') return null
   try {
-    const url = new URL(logoUrl)
+    const url = new URL(baseUrl)
     if (url.protocol !== 'https:' || url.host !== ASSETS_HOST || url.username || url.password) return null
-    return `${logoUrl}.webp`
+    return `${baseUrl}.webp`
   } catch {
     return null
   }
+}
+
+/** URL du logo d'une extension : `<logo>.webp` (règles de `setAssetWebpUrl`). */
+export const logoImageUrl = (logoUrl: string | null, language: Language): string | null => setAssetWebpUrl(logoUrl, language)
+
+/**
+ * URL du symbole d'une extension : `<symbol>.webp`, mêmes règles que le logo (les symboles sont
+ * souvent sous `univ`, ex. `https://assets.tcgdex.net/univ/sv/sv03.5/symbol`).
+ */
+export const symbolImageUrl = (symbolUrl: string | null, language: Language): string | null => setAssetWebpUrl(symbolUrl, language)
+
+/** Options de `checkWebp`. */
+export interface WebpCheckOptions {
+  /**
+   * Accepter aussi le type générique `application/octet-stream`. Réservé aux symboles d'extension :
+   * le CDN les sert ainsi (sondé le 14/11/2026 sur `univ/sv/sv03.5/symbol.webp` : 200, RIFF…WEBP,
+   * ETag = MD5). La signature, les tailles et le MD5 restent exigés ; jamais pour les autres images.
+   */
+  allowOctetStream?: boolean
 }
 
 export type WebpCheck =
@@ -123,10 +142,18 @@ const ascii = (bytes: Uint8Array, start: number, length: number) => String.fromC
  * Valide un fichier WebP téléchargé : type MIME, taille, signature `RIFF....WEBP`, taille RIFF
  * cohérente (fichier tronqué), longueur annoncée, et MD5 égal à l'ETag quand le CDN le fournit
  * (sur assets.tcgdex.net, l'ETag est le MD5 du contenu). Calcule le SHA-256 conservé en base.
+ * `application/octet-stream` n'est accepté qu'avec `allowOctetStream` (symboles d'extension).
  */
-export async function checkWebp(bytes: Uint8Array, headers: Headers, config: Pick<Config, 'minImageBytes' | 'maxImageBytes'>): Promise<WebpCheck> {
+export async function checkWebp(
+  bytes: Uint8Array,
+  headers: Headers,
+  config: Pick<Config, 'minImageBytes' | 'maxImageBytes'>,
+  options: WebpCheckOptions = {},
+): Promise<WebpCheck> {
   const contentType = (headers.get('content-type') ?? '').toLowerCase()
-  if (!contentType.includes('image/webp')) return { ok: false, reason: `type MIME inattendu : ${contentType || 'absent'}`, transient: false }
+  // Type générique toléré seul (sans autre type concaténé), et seulement si l'appelant l'autorise.
+  const octetStream = options.allowOctetStream === true && contentType.split(';')[0]?.trim() === 'application/octet-stream'
+  if (!contentType.includes('image/webp') && !octetStream) return { ok: false, reason: `type MIME inattendu : ${contentType || 'absent'}`, transient: false }
   const declared = headers.get('content-length')
   // Avec un encodage de transfert (gzip…), la longueur annoncée est celle des octets compressés.
   const encoded = !['', 'identity'].includes((headers.get('content-encoding') ?? '').trim().toLowerCase())

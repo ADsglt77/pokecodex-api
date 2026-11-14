@@ -1038,7 +1038,7 @@ describe('rapports', () => {
     expect(summary.languages[1]).toMatchObject({ cards: 3, imagesStored: 2, imagesMissing: 1, setsWithCards: 2 })
     expect(summary.total).toMatchObject({ cards: 7, imagesStored: 4, imagesMissing: 3, bytes: 1260, errors: 0 })
     expect(summary.sets).toHaveLength(4)
-    // Petites images et logo de swsh3 absents du faux CDN (404) : aucun objet secondaire.
+    // Petites images et logo de swsh3 absents du faux CDN (404), aucun symbole : aucun objet secondaire.
     expect(summary.audit).toEqual({
       r2Objects: 4,
       r2Bytes: 1260,
@@ -1047,6 +1047,7 @@ describe('rapports', () => {
       missingObjects: 0,
       lowImageObjects: 0,
       logoObjects: 0,
+      symbolObjects: 0,
       mediaReconciled: 0,
       mediaMissingObjects: 0,
     })

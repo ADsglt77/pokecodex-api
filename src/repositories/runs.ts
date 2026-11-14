@@ -142,8 +142,8 @@ export function updateSyncRunFoundStmt(db: Db, runId: number, seriesFound: numbe
 /**
  * Volume total stocké sous `cards/`, en octets (contrôle du plafond `MAX_STORED_BYTES`) : images
  * principales valides (index couvrant `cards_stored`), petites images copiées (index couvrant
- * `cards_low_stored` ; une petite image qui réutilise l'objet principal n'a pas de taille propre) et
- * logos copiés (table `sets`, quelques centaines de lignes).
+ * `cards_low_stored` ; une petite image qui réutilise l'objet principal n'a pas de taille propre),
+ * logos et symboles copiés (table `sets`, quelques centaines de lignes).
  */
 export async function storedBytes(db: Db): Promise<number> {
   const row = await db.first<{ bytes: number }>(
@@ -151,7 +151,8 @@ export async function storedBytes(db: Db): Promise<number> {
        (SELECT COALESCE(SUM(image_file_size), 0) FROM cards
          WHERE image_status IN ('downloaded', 'recovered_from_cdn', 'already_present'))
      + (SELECT COALESCE(SUM(image_low_file_size), 0) FROM cards WHERE image_low_status = 'downloaded')
-     + (SELECT COALESCE(SUM(logo_file_size), 0) FROM sets WHERE logo_status = 'downloaded') AS bytes`,
+     + (SELECT COALESCE(SUM(logo_file_size), 0) FROM sets WHERE logo_status = 'downloaded')
+     + (SELECT COALESCE(SUM(symbol_file_size), 0) FROM sets WHERE symbol_status = 'downloaded') AS bytes`,
   )
   return row?.bytes ?? 0
 }

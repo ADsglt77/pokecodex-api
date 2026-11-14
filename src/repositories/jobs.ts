@@ -19,7 +19,7 @@ export type JobType = (typeof JOB_TYPES)[number]
  * Ordre de traitement : catalogue, extensions, index des cartes, rapport, puis les images avant les
  * détails de cartes. Comme un détail de carte crée la tâche de son image, les images sont copiées au
  * fil de l'eau au lieu d'attendre la fin de tous les détails. Les copies secondaires (petites images,
- * logos) passent après tout le reste : `MEDIA_PRIORITY`.
+ * logos, symboles) passent après tout le reste : `MEDIA_PRIORITY`.
  */
 export const JOB_PRIORITY: Record<JobType, number> = {
   catalog: 0,
@@ -31,34 +31,39 @@ export const JOB_PRIORITY: Record<JobType, number> = {
 }
 
 /**
- * Copies secondaires (petite image `low.webp` d'une carte, logo d'une extension) : tâches de type
- * `image` (la contrainte CHECK de `job_type` n'est pas reconstruite), reconnues à leur charge utile
- * `{ media: 'low' | 'logo' }` et à leur `dedupe_key` (`image_low:<langue>:<carte>`,
- * `logo:<langue>:<extension>`). Priorité la plus basse : après toutes les autres tâches.
+ * Copies secondaires (petite image `low.webp` d'une carte, logo ou symbole d'une extension) : tâches
+ * de type `image` (la contrainte CHECK de `job_type` n'est pas reconstruite), reconnues à leur charge
+ * utile `{ media: 'low' | 'logo' | 'symbol' }` et à leur `dedupe_key` (`image_low:<langue>:<carte>`,
+ * `logo:<langue>:<extension>`, `symbol:<langue>:<extension>`). Priorité la plus basse : après
+ * toutes les autres tâches.
  */
-export type MediaKind = 'low' | 'logo'
+export type MediaKind = 'low' | 'logo' | 'symbol'
 export const MEDIA_PRIORITY = 6
+
+const MEDIA_KINDS: readonly MediaKind[] = ['low', 'logo', 'symbol']
 
 export const lowImageDedupeKey = (language: Language, cardTcgdexId: string): string => `image_low:${language}:${cardTcgdexId}`
 export const logoDedupeKey = (language: Language, setTcgdexId: string): string => `logo:${language}:${setTcgdexId}`
+export const symbolDedupeKey = (language: Language, setTcgdexId: string): string => `symbol:${language}:${setTcgdexId}`
 
 /** Nature d'une copie secondaire, ou `null` pour toute autre tâche (dont l'image principale). */
 export function mediaKind(job: { job_type: string; payload_json: string | null }): MediaKind | null {
   if (job.job_type !== 'image' || !job.payload_json) return null
   try {
     const media = (JSON.parse(job.payload_json) as { media?: unknown } | null)?.media
-    return media === 'low' || media === 'logo' ? media : null
+    return MEDIA_KINDS.find((kind) => kind === media) ?? null
   } catch {
     return null
   }
 }
 
 /**
- * Type affiché d'une tâche (statistiques, erreurs) : `image_low` et `logo` pour les copies
+ * Type affiché d'une tâche (statistiques, erreurs) : `image_low`, `logo` et `symbol` pour les copies
  * secondaires, sinon `job_type`. Expression SQL sur `import_jobs`.
  */
 export const JOB_KIND_SQL = `CASE WHEN job_type = 'image' AND substr(dedupe_key, 1, 10) = 'image_low:' THEN 'image_low'
-  WHEN job_type = 'image' AND substr(dedupe_key, 1, 5) = 'logo:' THEN 'logo' ELSE job_type END`
+  WHEN job_type = 'image' AND substr(dedupe_key, 1, 5) = 'logo:' THEN 'logo'
+  WHEN job_type = 'image' AND substr(dedupe_key, 1, 7) = 'symbol:' THEN 'symbol' ELSE job_type END`
 
 export interface Job {
   id: number

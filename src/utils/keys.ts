@@ -39,5 +39,11 @@ export function lowImageKey(mainKey: string): string | null {
  */
 export const setLogoKey = (language: Language, setTcgdexId: string): string => `cards/${language}/${encodeKeySegment(setTcgdexId)}/_logo.webp`
 
+/**
+ * Clé R2 du symbole d'une extension : `cards/<langue>/<extension>/_symbol.webp`. Même raisonnement que
+ * `_logo` : `s` n'est pas un chiffre hexadécimal, aucune clé de carte ne peut donc commencer ainsi.
+ */
+export const setSymbolKey = (language: Language, setTcgdexId: string): string => `cards/${language}/${encodeKeySegment(setTcgdexId)}/_symbol.webp`
+
 /** Identifiant interne d'une ligne : `<langue>:<id TCGdex>`. */
 export const internalId = (language: Language, tcgdexId: string): string => `${language}:${tcgdexId}`

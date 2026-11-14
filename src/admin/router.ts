@@ -13,7 +13,7 @@
  *   POST /admin/sync/resume            reprend (lève aussi une attente imposée, signalée en retour)
  *   POST /admin/sync/cancel            abandonne les synchronisations en cours (?language=)
  *   POST /admin/sync/retry-missing     relance images manquantes / en erreur et tâches en échec
- *   POST /admin/sync/backfill-media    crée les tâches des petites images et logos manquants (?language=)
+ *   POST /admin/sync/backfill-media    crée les tâches des petites images, logos et symboles manquants (?language=)
  *   POST /admin/reports/generate       demande un nouvel audit et de nouveaux exports
  *   POST /admin/tick                   lance une exécution courte (10 s au plus) tout de suite (?max_jobs=)
  *   POST /admin/selftest               vérifie D1, R2 et l'accès à TCGdex

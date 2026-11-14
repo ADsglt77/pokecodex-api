@@ -12,15 +12,16 @@ import {
   insertSetBriefsStmts,
   isValidImageStatus,
   markRemovedStmt,
-  setLogoState,
+  setMediaState,
   upsertCardBriefsStmts,
   upsertSeriesStmts,
   upsertSetDetailStmt,
   type CardBriefRow,
   type ExistingCard,
   type SetLogoState,
+  type SetSymbolState,
 } from '../repositories/catalog'
-import { dedupeKey, enqueueMediaStmts, enqueueStmts, logoDedupeKey, lowImageDedupeKey, type Job, type NewJob } from '../repositories/jobs'
+import { dedupeKey, enqueueMediaStmts, enqueueStmts, logoDedupeKey, lowImageDedupeKey, symbolDedupeKey, type Job, type NewJob } from '../repositories/jobs'
 import { updateSyncRunFoundStmt } from '../repositories/runs'
 import { seriesFromAssetUrl } from '../tcgdex/images'
 import { parseCardList, parseSeriesList, parseSetDetail, parseSetList, stripPricing, type CardBrief } from '../tcgdex/types'
@@ -69,6 +70,14 @@ export const logoJob = (language: Language, setTcgdexId: string): NewJob => ({
   cardId: null,
   dedupeKey: logoDedupeKey(language, setTcgdexId),
   payload: { media: 'logo' },
+})
+
+/** Copie du symbole d'une extension : tâche `image` de priorité `MEDIA_PRIORITY`. */
+export const symbolJob = (language: Language, setTcgdexId: string): NewJob => ({
+  target: setTcgdexId,
+  cardId: null,
+  dedupeKey: symbolDedupeKey(language, setTcgdexId),
+  payload: { media: 'symbol' },
 })
 
 /** Tâche `catalog` : séries et extensions d'une langue, puis une tâche `set` par extension. */
@@ -157,23 +166,36 @@ export function needsLowImage(card: ExistingCard | undefined, mainQueued: boolea
 }
 
 /**
- * Faut-il (re)copier le logo de cette extension ? Si l'API en donne un et qu'il n'est pas déjà
- * copié : jamais traité, URL changée depuis la dernière vérification, ou absent / en erreur depuis
- * plus de `recheckDays` jours. Un logo copié n'est jamais remplacé.
+ * Faut-il (re)copier cette image d'extension (logo ou symbole) ? Si l'API en donne une et qu'elle
+ * n'est pas déjà copiée : jamais traitée, URL changée depuis la dernière vérification, ou absente / en
+ * erreur depuis plus de `recheckDays` jours. Une image copiée n'est jamais remplacée.
  */
-export function needsLogo(state: SetLogoState | null, logoUrl: string | null, nowMs: number, recheckDays: number): boolean {
-  if (!logoUrl) return false
-  if (!state || state.logo_status === null) return true
-  if (state.logo_status === 'downloaded') return false
-  if (state.logo_source_url !== `${logoUrl}.webp` || !state.logo_checked_at) return true
-  return nowMs - Date.parse(state.logo_checked_at) > recheckDays * DAY_MS
+function needsSetMedia(
+  state: { status: string | null; checkedAt: string | null; sourceUrl: string | null } | null,
+  url: string | null,
+  nowMs: number,
+  recheckDays: number,
+): boolean {
+  if (!url) return false
+  if (!state || state.status === null) return true
+  if (state.status === 'downloaded') return false
+  if (state.sourceUrl !== `${url}.webp` || !state.checkedAt) return true
+  return nowMs - Date.parse(state.checkedAt) > recheckDays * DAY_MS
 }
+
+/** Faut-il (re)copier le logo de cette extension ? (règle de `needsSetMedia`) */
+export const needsLogo = (state: SetLogoState | null, logoUrl: string | null, nowMs: number, recheckDays: number): boolean =>
+  needsSetMedia(state && { status: state.logo_status, checkedAt: state.logo_checked_at, sourceUrl: state.logo_source_url }, logoUrl, nowMs, recheckDays)
+
+/** Faut-il (re)copier le symbole de cette extension ? (même règle que le logo) */
+export const needsSymbol = (state: SetSymbolState | null, symbolUrl: string | null, nowMs: number, recheckDays: number): boolean =>
+  needsSetMedia(state && { status: state.symbol_status, checkedAt: state.symbol_checked_at, sourceUrl: state.symbol_source_url }, symbolUrl, nowMs, recheckDays)
 
 /**
  * Tâche `set` : détail d'une extension et liste de ses cartes. Crée ou met à jour les cartes, puis
  * les tâches nécessaires : image pour toute carte sans image valide, détail pour toute carte
  * nouvelle, modifiée ou dont le détail a plus de `detailRefreshDays` jours, et, en dernière
- * priorité, petite image des cartes qui n'en ont pas et logo de l'extension s'il manque.
+ * priorité, petite image des cartes qui n'en ont pas, logo et symbole de l'extension s'ils manquent.
  */
 export async function runSetJob(ctx: JobContext, job: Job): Promise<JobResult> {
   const language = jobLanguage(job)
@@ -222,12 +244,17 @@ export async function runSetJob(ctx: JobContext, job: Job): Promise<JobResult> {
     if (needsImage(known, imageChanged, nowMs, config.missingRecheckDays)) imageJobs.push(imageJob(language, card.id))
   }
 
-  // Petites images (après l'image principale) et logo de l'extension.
+  // Petites images (après l'image principale), logo et symbole de l'extension (une seule lecture de
+  // leur état, et seulement si l'API donne l'un ou l'autre).
   const mainQueued = new Set(imageJobs.map((item) => item.target))
   const lowJobs = listedCards
     .filter((card) => needsLowImage(existing.get(card.id), mainQueued.has(card.id), nowMs, config.missingRecheckDays))
     .map((card) => lowImageJob(language, card.id))
-  const logo = detail.logo && needsLogo(await setLogoState(db, internalId(language, setId)), detail.logo, nowMs, config.missingRecheckDays) ? [logoJob(language, setId)] : []
+  const mediaState = detail.logo || detail.symbol ? await setMediaState(db, internalId(language, setId)) : null
+  const setMedia = [
+    ...(needsLogo(mediaState, detail.logo, nowMs, config.missingRecheckDays) ? [logoJob(language, setId)] : []),
+    ...(needsSymbol(mediaState, detail.symbol, nowMs, config.missingRecheckDays) ? [symbolJob(language, setId)] : []),
+  ]
 
   // Cartes qui ne sont plus listées : marquées, jamais supprimées. Seules comptent les cartes déjà
   // listées par cette extension (`brief_hash` connu) : une carte venue de l'index `/cards` n'y a
@@ -263,7 +290,7 @@ export async function runSetJob(ctx: JobContext, job: Job): Promise<JobResult> {
     ...upsertCardBriefsStmts(db, language, setId, seriesId, changedBriefs, nowMs),
     ...enqueueStmts(db, 'image', language, imageJobs, { runId: job.run_id, maxAttempts: config.maxAttempts, nowMs }),
     ...enqueueStmts(db, 'card', language, cardJobs, { runId: job.run_id, maxAttempts: config.maxAttempts, nowMs }),
-    ...enqueueMediaStmts(db, language, [...lowJobs, ...logo], { runId: job.run_id, maxAttempts: config.maxAttempts, nowMs }),
+    ...enqueueMediaStmts(db, language, [...lowJobs, ...setMedia], { runId: job.run_id, maxAttempts: config.maxAttempts, nowMs }),
   )
   if (vanished.length && plausibleRemoval) statements.push(markRemovedStmt(db, vanished, nowMs))
   return { kind: 'done', statements, httpStatus: outcome.status }

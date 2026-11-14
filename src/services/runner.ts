@@ -17,7 +17,7 @@
 
 import type { Config } from '../config'
 import { Db, Usage } from '../db'
-import { cardsForJobs, setsForLogoJobs, type CardForJob, type SetForLogoJob } from '../repositories/catalog'
+import { cardsForJobs, setsForMediaJobs, type CardForJob, type SetForMediaJob } from '../repositories/catalog'
 import {
   claimJobs,
   completeStmt,
@@ -56,7 +56,7 @@ import { imageJob, runCardIndexJob, runCatalogJob, runSetJob } from './catalog'
 import { runCardJob } from './cards'
 import { jobPayload, type JobContext, type JobResult } from './context'
 import { runImageJob } from './downloader'
-import { imageJobFailureStmts, runLogoJob, runLowImageJob } from './media'
+import { imageJobFailureStmts, runLogoJob, runLowImageJob, runSymbolJob } from './media'
 import { runReportJob } from './reports'
 
 export interface RunnerDeps {
@@ -156,7 +156,7 @@ export async function runTick(deps: RunnerDeps, opts: TickOptions): Promise<Tick
     }
 
     // 3. Tâches d'une exécution interrompue.
-    // Tâche d'image (principale, petite image ou logo) épuisée : sa cible passe en download_error.
+    // Tâche d'image (principale, petite image, logo ou symbole) épuisée : sa cible passe en download_error.
     const expiredFailures = await reclaimExpired(db, now())
     const lostImages = expiredFailures.flatMap((job) => imageJobFailureStmts(db, job, 'verrou expiré : nombre maximal de tentatives atteint', now()))
     if (lostImages.length) await db.batch(lostImages)
@@ -216,9 +216,12 @@ export async function runTick(deps: RunnerDeps, opts: TickOptions): Promise<Tick
       counters.claimed += jobs.length
       const cardIds = jobs.filter((job) => (job.job_type === 'card' || job.job_type === 'image') && job.card_id).map((job) => job.card_id as string)
       const cards = await cardsForJobs(db, cardIds)
-      // Extensions des tâches de logo (une requête de plus, seulement si le lot en contient).
-      const logoSetId = (job: Job): string | null => (mediaKind(job) === 'logo' && job.language && job.target_id ? internalId(job.language, job.target_id) : null)
-      const sets = await setsForLogoJobs(db, jobs.map(logoSetId).filter((id): id is string => id !== null))
+      // Extensions des tâches de logo et de symbole (une requête de plus, seulement si le lot en contient).
+      const mediaSetId = (job: Job): string | null => {
+        const media = mediaKind(job)
+        return (media === 'logo' || media === 'symbol') && job.language && job.target_id ? internalId(job.language, job.target_id) : null
+      }
+      const sets = await setsForMediaJobs(db, jobs.map(mediaSetId).filter((id): id is string => id !== null))
 
       const results = await mapPool(jobs, config.maxConcurrency, async (job): Promise<JobResult> => {
         // Budget dépassé avant le début de la tâche : rendue intacte pour l'exécution suivante.
@@ -226,7 +229,7 @@ export async function runTick(deps: RunnerDeps, opts: TickOptions): Promise<Tick
           return { kind: 'release', reason: 'exécution arrêtée avant cette tâche', httpStatus: null, delayMs: 0 }
         }
         try {
-          const setId = logoSetId(job)
+          const setId = mediaSetId(job)
           return await runJob(ctx, job, job.card_id ? cards.get(job.card_id) : undefined, setId ? sets.get(setId) : undefined)
         } catch (jobError) {
           logError('job_exception', jobError, { jobId: job.id, type: job.job_type })
@@ -317,7 +320,7 @@ function skipReason(state: Map<string, StateRow>, config: Config, nowMs: number)
 }
 
 /** Aiguille une tâche vers son traitement. */
-async function runJob(ctx: JobContext, job: Job, card: CardForJob | undefined, set: SetForLogoJob | undefined): Promise<JobResult> {
+async function runJob(ctx: JobContext, job: Job, card: CardForJob | undefined, set: SetForMediaJob | undefined): Promise<JobResult> {
   switch (job.job_type) {
     case 'catalog':
       return runCatalogJob(ctx, job)
@@ -328,10 +331,11 @@ async function runJob(ctx: JobContext, job: Job, card: CardForJob | undefined, s
     case 'card':
       return runCardJob(ctx, job, card)
     case 'image': {
-      // Copies secondaires (petite image, logo) : même type de tâche, priorité la plus basse.
+      // Copies secondaires (petite image, logo, symbole) : même type de tâche, priorité la plus basse.
       const media = mediaKind(job)
       if (media === 'low') return runLowImageJob(ctx, job, card)
       if (media === 'logo') return runLogoJob(ctx, job, set)
+      if (media === 'symbol') return runSymbolJob(ctx, job, set)
       return runImageJob(ctx, job, card)
     }
     case 'report':
@@ -343,7 +347,7 @@ type Outcome = 'done' | 'failed' | 'retried' | 'released'
 
 /**
  * Écritures de clôture d'une tâche, précédées du garde-fou de verrou. Une tâche d'image qui échoue
- * définitivement sans motif propre passe sa cible (image principale, petite image ou logo) en
+ * définitivement sans motif propre passe sa cible (image principale, petite image, logo ou symbole) en
  * `download_error` (visible et relançable).
  * Une tâche rendue trop souvent (`maxReleases`) consomme désormais une tentative : jamais de boucle.
  */
@@ -356,7 +360,7 @@ function closingStatements(
   random: () => number,
 ): { statements: D1PreparedStatement[]; outcome: Outcome } {
   const guard = guardStmt(db, job)
-  // Conséquence par défaut d'un échec définitif : une image (principale, petite image ou logo) qui
+  // Conséquence par défaut d'un échec définitif : une image (principale, petite image, logo, symbole) qui
   // échoue passe en `download_error` ; une carte venue de l'index dont le détail échoue voit quand
   // même son image cherchée.
   const imageFailure = (reason: string): D1PreparedStatement[] => {

@@ -18,11 +18,14 @@ export type ImageStatus = 'pending' | (typeof VALID_IMAGE_STATUSES)[number] | (t
 export const isValidImageStatus = (status: string): boolean => (VALID_IMAGE_STATUSES as readonly string[]).includes(status)
 
 /**
- * Statuts des petites images et des logos (`image_low_status`, `logo_status`, NULL = jamais traité) :
- * `downloaded` est le seul qui signifie « présent dans R2 » (contrat avec le site).
+ * Statuts des petites images, logos et symboles (`image_low_status`, `logo_status`, `symbol_status`,
+ * NULL = jamais traité) : `downloaded` est le seul qui signifie « présent dans R2 » (contrat avec le site).
  */
 export type MediaStatus = 'downloaded' | (typeof MISSING_IMAGE_STATUSES)[number] | (typeof ERROR_IMAGE_STATUSES)[number]
 export type MediaFailureStatus = Exclude<MediaStatus, 'downloaded'>
+
+/** Images d'une extension copiées dans R2 : logo (colonnes `logo_*`) et symbole (`symbol_*`). */
+export type SetMediaKind = 'logo' | 'symbol'
 
 /** Blocs de lignes pour `json_each` (chaque valeur liée reste loin de la limite de 2 Mo). */
 function chunks<T>(rows: T[], size = 400): T[][] {
@@ -255,15 +258,28 @@ export function existingCardsOfSet(db: Db, setInternalId: string): Promise<Exist
   )
 }
 
-/** État du logo d'une extension (décision de la tâche `set`), ou `null` si l'extension est inconnue. */
+/** État du logo d'une extension (décision de la tâche `set`). */
 export interface SetLogoState {
   logo_status: MediaStatus | null
   logo_checked_at: string | null
   logo_source_url: string | null
 }
 
-export function setLogoState(db: Db, setInternalId: string): Promise<SetLogoState | null> {
-  return db.first<SetLogoState>(`SELECT logo_status, logo_checked_at, logo_source_url FROM sets WHERE id = ?1`, setInternalId)
+/** État du symbole d'une extension (décision de la tâche `set`). */
+export interface SetSymbolState {
+  symbol_status: MediaStatus | null
+  symbol_checked_at: string | null
+  symbol_source_url: string | null
+}
+
+export type SetMediaState = SetLogoState & SetSymbolState
+
+/** Logo et symbole d'une extension, en une requête ; `null` si l'extension est inconnue. */
+export function setMediaState(db: Db, setInternalId: string): Promise<SetMediaState | null> {
+  return db.first<SetMediaState>(
+    `SELECT logo_status, logo_checked_at, logo_source_url, symbol_status, symbol_checked_at, symbol_source_url FROM sets WHERE id = ?1`,
+    setInternalId,
+  )
 }
 
 export interface CardDetailRow {
@@ -446,52 +462,66 @@ export function lowImageFailureStmt(db: Db, cardId: string, failure: { status: M
   )
 }
 
-/** Ce que la tâche de logo lit d'une extension. */
-export interface SetForLogoJob {
+/** Ce que les tâches de logo et de symbole lisent d'une extension. */
+export interface SetForMediaJob {
   id: string
   tcgdex_id: string
   language: Language
   logo_url: string | null
   logo_status: MediaStatus | null
   logo_r2_key: string | null
+  symbol_url: string | null
+  symbol_status: MediaStatus | null
+  symbol_r2_key: string | null
 }
 
-/** Lit en une requête les extensions de plusieurs tâches de logo. */
-export async function setsForLogoJobs(db: Db, setIds: string[]): Promise<Map<string, SetForLogoJob>> {
+/** Lit en une requête les extensions de plusieurs tâches de logo ou de symbole. */
+export async function setsForMediaJobs(db: Db, setIds: string[]): Promise<Map<string, SetForMediaJob>> {
   if (!setIds.length) return new Map()
-  const rows = await db.all<SetForLogoJob>(
-    `SELECT id, tcgdex_id, language, logo_url, logo_status, logo_r2_key
+  const rows = await db.all<SetForMediaJob>(
+    `SELECT id, tcgdex_id, language, logo_url, logo_status, logo_r2_key, symbol_url, symbol_status, symbol_r2_key
      FROM sets WHERE id IN (SELECT value FROM json_each(?1))`,
     JSON.stringify([...new Set(setIds)]),
   )
   return new Map(rows.map((row) => [row.id, row]))
 }
 
-export function logoSuccessStmt(db: Db, setId: string, logo: { key: string; sourceUrl: string | null; size: number; sha256: string | null }, nowMs: number): D1PreparedStatement {
+export interface SetMediaSuccess {
+  key: string
+  /** URL testée ; `null` (objet déjà présent, réconcilié) garde la précédente. */
+  sourceUrl: string | null
+  size: number
+  sha256: string | null
+}
+
+export interface SetMediaFailure {
+  status: MediaFailureStatus
+  reason: string
+  sourceUrl?: string | null
+}
+
+// `kind` vient d'une union fermée (jamais d'une donnée externe) : seuls `logo_*` et `symbol_*`
+// peuvent être nommés ; toutes les valeurs restent des paramètres liés.
+function setMediaSuccessStmt(db: Db, kind: SetMediaKind, setId: string, media: SetMediaSuccess, nowMs: number): D1PreparedStatement {
   return db.stmt(
-    `UPDATE sets SET logo_status = 'downloaded', logo_r2_key = ?2, logo_source_url = COALESCE(?3, logo_source_url),
-       logo_file_size = ?4, logo_sha256 = ?5, logo_checked_at = ?6, logo_failure_reason = NULL, updated_at = ?6
+    `UPDATE sets SET ${kind}_status = 'downloaded', ${kind}_r2_key = ?2, ${kind}_source_url = COALESCE(?3, ${kind}_source_url),
+       ${kind}_file_size = ?4, ${kind}_sha256 = ?5, ${kind}_checked_at = ?6, ${kind}_failure_reason = NULL, updated_at = ?6
      WHERE id = ?1`,
     setId,
-    logo.key,
-    logo.sourceUrl,
-    logo.size,
-    logo.sha256,
+    media.key,
+    media.sourceUrl,
+    media.size,
+    media.sha256,
     iso(nowMs),
   )
 }
 
-/** Échec d'un logo, sans jamais effacer un logo déjà copié. */
-export function logoFailureStmt(
-  db: Db,
-  setId: string,
-  failure: { status: MediaFailureStatus; reason: string; sourceUrl?: string | null },
-  nowMs: number,
-): D1PreparedStatement {
+/** Échec d'une image d'extension, sans jamais effacer une image déjà copiée. */
+function setMediaFailureStmt(db: Db, kind: SetMediaKind, setId: string, failure: SetMediaFailure, nowMs: number): D1PreparedStatement {
   return db.stmt(
-    `UPDATE sets SET logo_status = ?2, logo_failure_reason = ?3, logo_source_url = COALESCE(?4, logo_source_url),
-       logo_checked_at = ?5, updated_at = ?5
-     WHERE id = ?1 AND logo_status IS NOT 'downloaded'`,
+    `UPDATE sets SET ${kind}_status = ?2, ${kind}_failure_reason = ?3, ${kind}_source_url = COALESCE(?4, ${kind}_source_url),
+       ${kind}_checked_at = ?5, updated_at = ?5
+     WHERE id = ?1 AND ${kind}_status IS NOT 'downloaded'`,
     setId,
     failure.status,
     failure.reason,
@@ -499,3 +529,13 @@ export function logoFailureStmt(
     iso(nowMs),
   )
 }
+
+export const logoSuccessStmt = (db: Db, setId: string, logo: SetMediaSuccess, nowMs: number): D1PreparedStatement => setMediaSuccessStmt(db, 'logo', setId, logo, nowMs)
+
+/** Échec d'un logo, sans jamais effacer un logo déjà copié. */
+export const logoFailureStmt = (db: Db, setId: string, failure: SetMediaFailure, nowMs: number): D1PreparedStatement => setMediaFailureStmt(db, 'logo', setId, failure, nowMs)
+
+export const symbolSuccessStmt = (db: Db, setId: string, symbol: SetMediaSuccess, nowMs: number): D1PreparedStatement => setMediaSuccessStmt(db, 'symbol', setId, symbol, nowMs)
+
+/** Échec d'un symbole, sans jamais effacer un symbole déjà copié. */
+export const symbolFailureStmt = (db: Db, setId: string, failure: SetMediaFailure, nowMs: number): D1PreparedStatement => setMediaFailureStmt(db, 'symbol', setId, failure, nowMs)
