@@ -101,6 +101,17 @@ Sous npm 11, les scripts d'installation de `workerd` et `esbuild` doivent être 
 
 ## Déploiement
 
+**Workers Builds** (Cloudflare relié au dépôt GitHub, comme `pokedex` et `pokedex-data`) déploie le
+Worker à chaque push sur `main` : `npm run ci` (TypeScript strict et tous les tests ; un échec
+arrête là, la version d'avant continue), puis `npm run deploy` (les migrations D1 distantes, puis
+le Worker). Réglages du tableau de bord (Workers & Pages › `pokecodex-importer` › Settings ›
+Build) : dépôt `ADsglt77/pokecodex-api`, branche `main`, construction `npm run ci`, déploiement
+`npm run deploy`, variable de construction `NODE_VERSION` = `24` ; le token de construction doit
+avoir « D1 : Edit » (les migrations). Une migration part donc avec le push qui l'ajoute : seulement
+des ajouts (`ADD COLUMN`, index), que l'ancien code supporte.
+
+À la main, si besoin (et la première fois, le jeton) :
+
 ```bash
 npx wrangler login                       # une fois
 npm run check

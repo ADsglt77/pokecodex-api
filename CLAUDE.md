@@ -30,7 +30,8 @@ sur un Worker Cloudflare indépendant (`pokecodex-importer`). Tout le fonctionne
 ```bash
 npm run check          # tsc strict + tests Vitest (workerd, aucun réseau)
 npm run test:live      # test réel contre TCGdex (~15 requêtes, aucune écriture)
-npm run deploy         # migrations D1 distantes + wrangler deploy
+npm run ci             # ce que lance Workers Builds avant de déployer (= npm run check)
+npm run deploy         # migrations D1 distantes + wrangler deploy (Workers Builds, à chaque push sur main)
 npx wrangler tail pokecodex-importer --format json   # journaux en direct
 ```
 
