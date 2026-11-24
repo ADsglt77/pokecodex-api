@@ -56,6 +56,11 @@ export interface LanguageStats {
   symbolsErrors: number
   symbolsPending: number
   symbolBytes: number
+  /** Lignes et images ajoutées par l'API d'import (autre source que TCGdex : `data_source`, `*_provider`). */
+  manualSets: number
+  manualCards: number
+  manualImages: number
+  manualLogos: number
 }
 
 export interface JobCount {
@@ -111,7 +116,7 @@ async function languageStats(db: Db, language: Language): Promise<LanguageStats>
        COALESCE(SUM(removed_at IS NOT NULL), 0) AS removed,
        COALESCE(SUM(removed_at IS NULL AND api_image_url IS NOT NULL), 0) AS withApiImageUrl,
        COALESCE(SUM(removed_at IS NULL AND detail_status = 'fetched'), 0) AS detailsFetched,
-       COALESCE(SUM(removed_at IS NULL AND detail_status IN ('pending', 'error')), 0) AS detailsPending,
+       COALESCE(SUM(removed_at IS NULL AND data_source IS NULL AND detail_status IN ('pending', 'error')), 0) AS detailsPending,
        COALESCE(SUM(removed_at IS NULL AND detail_status = 'not_found'), 0) AS detailsNotFound,
        COALESCE(SUM(removed_at IS NULL AND image_status = 'pending'), 0) AS imagesPending,
        COALESCE(SUM(removed_at IS NULL AND image_status = 'downloaded'), 0) AS imagesDownloaded,
@@ -140,7 +145,12 @@ async function languageStats(db: Db, language: Language): Promise<LanguageStats>
        (SELECT COUNT(*) FROM sets WHERE language = ?1 AND symbol_status IN ('missing_api_url', 'not_found_on_cdn')) AS symbolsMissing,
        (SELECT COUNT(*) FROM sets WHERE language = ?1 AND symbol_status IN ('download_error', 'invalid_image')) AS symbolsErrors,
        (SELECT COUNT(*) FROM sets WHERE language = ?1 AND symbol_url IS NOT NULL AND symbol_status IS NULL) AS symbolsPending,
-       (SELECT COALESCE(SUM(symbol_file_size), 0) FROM sets WHERE language = ?1 AND symbol_status = 'downloaded') AS symbolBytes
+       (SELECT COALESCE(SUM(symbol_file_size), 0) FROM sets WHERE language = ?1 AND symbol_status = 'downloaded') AS symbolBytes,
+       (SELECT COUNT(*) FROM sets WHERE language = ?1 AND data_source IS NOT NULL) AS manualSets,
+       COALESCE(SUM(removed_at IS NULL AND data_source IS NOT NULL), 0) AS manualCards,
+       COALESCE(SUM(removed_at IS NULL AND image_provider IS NOT NULL
+         AND image_status IN ('downloaded', 'recovered_from_cdn', 'already_present')), 0) AS manualImages,
+       (SELECT COUNT(*) FROM sets WHERE language = ?1 AND logo_provider IS NOT NULL AND logo_status = 'downloaded') AS manualLogos
      FROM cards WHERE language = ?1`,
     language,
   )
@@ -262,8 +272,12 @@ export function formatStatus(stats: Stats): string {
       `${pad('Erreurs')}: ${n(lang.errors)}`,
       `${pad('En attente')}: ${n(lang.imagesPending)}`,
       `${pad('Petites images (low)')}: ${n(lang.lowImagesStored)} / ${n(lang.imagesStored)} (introuvables ${n(lang.lowImagesMissing)}, erreurs ${n(lang.lowImagesErrors)}, à faire ${n(lang.lowImagesPending)})`,
-      `${pad('Logos d’extension')}: ${n(lang.logosStored)} / ${n(lang.setsWithLogo)} (introuvables ${n(lang.logosMissing)}, erreurs ${n(lang.logosErrors)}, à faire ${n(lang.logosPending)})`,
+      // Logos copiés de TCGdex / extensions dont TCGdex donne un logo ; les ajouts sont comptés à part.
+      `${pad('Logos d’extension')}: ${n(lang.logosStored - lang.manualLogos)} / ${n(lang.setsWithLogo)} (introuvables ${n(lang.logosMissing)}, erreurs ${n(lang.logosErrors)}, à faire ${n(lang.logosPending)})`,
       `${pad('Symboles d’extension')}: ${n(lang.symbolsStored)} / ${n(lang.setsWithSymbol)} (introuvables ${n(lang.symbolsMissing)}, erreurs ${n(lang.symbolsErrors)}, à faire ${n(lang.symbolsPending)})`,
+      ...(lang.manualCards || lang.manualSets || lang.manualImages || lang.manualLogos
+        ? [`${pad('Ajouts hors TCGdex')}: ${n(lang.manualSets)} extensions, ${n(lang.manualCards)} cartes, ${n(lang.manualImages)} images, ${n(lang.manualLogos)} logos`]
+        : []),
       '',
     )
   }

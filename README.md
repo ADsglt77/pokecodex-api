@@ -332,6 +332,48 @@ Ou avec curl : `curl -s -H "Authorization: Bearer $(cat .secrets/admin-token.txt
 | `POST /admin/reports/generate` | nouvel audit et nouveaux exports |
 | `POST /admin/tick` | une exécution courte tout de suite (20 s au plus, `?max_jobs=`) |
 | `POST /admin/selftest` | vérifie D1, R2 et l'accès à TCGdex |
+| `POST /admin/import/catalog` | ajoute séries, extensions et cartes d'une autre source (corps JSON, voir « Ajouts hors TCGdex ») ; ne modifie jamais une ligne existante |
+| `POST /admin/import/image` | envoie l'image d'une carte ou le logo d'une extension (corps WebP ; `?kind=main\|low\|logo&language=&target=&source=`) ; n'écrase jamais rien |
+
+## Ajouts hors TCGdex (copie Pokécardex)
+
+Les cartes, extensions et logos absents de TCGdex peuvent être ajoutés depuis la copie Pokécardex
+du 28/10/2026 (faite sous l'ancien accord ; l'utilisateur a levé le 23/11/2026 sa décision du 13/11
+d'écarter Pokécardex). Rien n'est téléchargé : tout part de la copie locale.
+
+- **Migration `0004_manual_sources.sql`** (ajouts de colonnes seulement) : `series.data_source`,
+  `sets.data_source`, `sets.logo_provider`, `cards.data_source`, `cards.image_provider` ; NULL =
+  TCGdex, `'pokecardex'` = ajout. Le site ne lit pas ces colonnes.
+- **`POST /admin/import/catalog`** : `{ language, series?: [{id, name}], sets?: [{id, name, series,
+  releaseDate, officialCards, totalCards, metadata}], cards?: [{id, set, localId, name, rarity,
+  category, illustrator, metadata}] }`. Contrôles du contrat du site : id d'extension
+  `[A-Za-z0-9._-]{1,32}` unique par langue au sens de `setKey` (majuscules, sans `-`), numéro
+  `^[a-z]*\d+[a-z]*$` unique dans l'extension au sens de `numberKey` (`017` ≡ `17`), catégorie dans le
+  vocabulaire TCGdex de la langue, `metadata` JSON (`dexId` et `variants_detailed` en tableaux,
+  `variants` en objet), série existante de la même langue (jamais `tcgp`), date à venir ignorée.
+  Une ligne existante (TCGdex ou import précédent) n'est jamais modifiée ; chaque refus est rendu avec
+  son motif. Les cartes ajoutées gardent `brief_hash` NULL : la synchronisation TCGdex ne les retire
+  jamais, et si TCGdex publie un jour la même carte sous le même id, son upsert la reprend
+  (`data_source` NULL, image conservée).
+- **`POST /admin/import/image`** : `main` (image principale d'une carte sans image valide, clé
+  `cards/<l>/<ext>/<carte>.webp`), `low` (petite image d'une carte dont l'image principale vient de la
+  même source, `….low.webp`), `logo` (extension sans logo, `cards/<l>/<ext>/_logo.webp`). WebP validé
+  comme pour TCGdex ; métadonnées R2 `source: pokecardex`, `sourceUrl`, `sha256` et l'identité
+  attendue par les tâches (`tcgdexId`, `setId`) ; écriture conditionnelle (`onlyIf`) : un objet déjà
+  présent n'est jamais remplacé (même contenu : réconcilié).
+- **Scripts** : `scripts/pokecardex/prepare.mjs` construit les lots depuis la copie locale et les
+  fichiers d'analyse (dans `.local/pokecardex/`, ignoré par Git) ; `scripts/import-manual.mjs`
+  (`catalog`, `logos`, `images`) les envoie, avec journal de reprise.
+- **Filigranes** : les scans de Pokécardex portent souvent un filigrane intégré (« POKÉCARDEX » en
+  bande à mi-hauteur, en diagonale, ou « pokecardex.com ») ; les rendus numériques officiels sont
+  propres, mais dans beaucoup d'extensions japonaises les cartes secrètes (UR dorées) sont des scans
+  filigranés. Aucune image n'est envoyée sans vérification carte par carte (bande centrale à contraste
+  renforcé) ; en cas de doute, l'utilisateur tranche. Les détecteurs automatiques essayés (corrélation
+  avec le motif moyen) ne séparent pas assez bien les cartes propres des filigranées.
+- **Import du 24/11/2026** : 2 séries (JA `DP`, `DPt`), 277 extensions, 16 442 cartes, 504 logos et
+  13 997 images (FR 524, JA 13 473) ; 618 images filigranées et 7 cartes BWP portant un texte ajouté
+  (« Carte jamais… ») écartées. Les cartes ajoutées sans image propre sont en `missing_api_url`
+  (motif « aucune image propre disponible »).
 
 ## Estimation des coûts
 

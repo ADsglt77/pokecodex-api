@@ -17,12 +17,16 @@
  *   POST /admin/reports/generate       demande un nouvel audit et de nouveaux exports
  *   POST /admin/tick                   lance une exécution courte (10 s au plus) tout de suite (?max_jobs=)
  *   POST /admin/selftest               vérifie D1, R2 et l'accès à TCGdex
+ *   POST /admin/import/catalog         ajoute extensions et cartes d'une autre source (JSON, jamais d'écrasement)
+ *   POST /admin/import/image           envoie l'image d'une carte ou le logo d'une extension (corps WebP ;
+ *                                      ?kind=main|low|logo&language=fr|ja&target=<id>&source=<adresse d'origine>)
  */
 
 import { IMAGES_PREFIX, isLanguage, REPORTS_PREFIX, type Config, type Language } from '../config'
 import { Db } from '../db'
 import { ERROR_IMAGE_STATUSES, MISSING_IMAGE_STATUSES } from '../repositories/catalog'
 import { enqueueStmts } from '../repositories/jobs'
+import { importCatalog, InputError, MAX_CATALOG_BYTES, storeImage, type ImageKind } from '../services/manual-import'
 import { failedJobs, problemCards, setCoverage } from '../services/reports'
 import { runTick } from '../services/runner'
 import { collectStats, formatStatus } from '../services/stats'
@@ -75,6 +79,8 @@ const POST_ROUTES = [
   '/admin/reports/generate',
   '/admin/tick',
   '/admin/selftest',
+  '/admin/import/catalog',
+  '/admin/import/image',
 ]
 
 /** Langues demandées (`?language=fr,ja`), toutes par défaut ; `null` si une valeur est inconnue. */
@@ -230,12 +236,67 @@ export async function handleAdmin(request: Request, deps: AdminDeps): Promise<Re
         return json(await tick)
       }
       if (path === '/admin/selftest') return json(await selfTest(deps, db, now))
+      if (path === '/admin/import/catalog') {
+        const bytes = await readBody(request, MAX_CATALOG_BYTES)
+        if (!bytes) return json({ error: `corps JSON attendu (${MAX_CATALOG_BYTES} octets au plus)` }, 413)
+        let raw: unknown
+        try {
+          raw = JSON.parse(new TextDecoder().decode(bytes))
+        } catch {
+          return json({ error: 'JSON invalide' }, 400)
+        }
+        return json(await importCatalog(db, raw, now()))
+      }
+      if (path === '/admin/import/image') {
+        const kind = url.searchParams.get('kind') as ImageKind | null
+        const language = url.searchParams.get('language')
+        const target = url.searchParams.get('target') ?? ''
+        const source = url.searchParams.get('source') ?? ''
+        if (!kind || !['main', 'low', 'logo'].includes(kind)) return json({ error: 'kind : main, low ou logo' }, 400)
+        if (!isLanguage(language)) return json({ error: 'langue inconnue (fr ou ja)' }, 400)
+        if (!target || target.length > 80) return json({ error: 'target manquant' }, 400)
+        if (!/^https:\/\/[^\s]{1,400}$/.test(source)) return json({ error: 'source : adresse https d’origine attendue' }, 400)
+        const bytes = await readBody(request, config.maxImageBytes)
+        if (!bytes) return json({ error: `corps WebP attendu (${config.maxImageBytes} octets au plus)` }, 413)
+        const outcome = await storeImage(db, deps.bucket, config, { kind, language, target, sourceUrl: source, bytes }, now())
+        const status = { stored: 201, reconciled: 200, unchanged: 200, conflict: 409, not_found: 404, invalid: 422 }[outcome.status]
+        return json(outcome, status)
+      }
     }
 
     return json({ error: 'route inconnue' }, 404)
   } catch (error) {
+    if (error instanceof InputError) return json({ error: error.message }, 400)
     return json({ error: errorMessage(error) }, 500)
   }
+}
+
+/** Corps de la requête, ou `null` s'il est vide ou dépasse `max` octets (lecture plafonnée). */
+async function readBody(request: Request, max: number): Promise<Uint8Array | null> {
+  const declared = Number(request.headers.get('content-length') ?? NaN)
+  if (Number.isFinite(declared) && declared > max) return null
+  if (!request.body) return null
+  const reader = request.body.getReader()
+  const parts: Uint8Array[] = []
+  let size = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    size += value.byteLength
+    if (size > max) {
+      await reader.cancel()
+      return null
+    }
+    parts.push(value)
+  }
+  if (!size) return null
+  const out = new Uint8Array(size)
+  let offset = 0
+  for (const part of parts) {
+    out.set(part, offset)
+    offset += part.byteLength
+  }
+  return out
 }
 
 /** Vérifie les liaisons réelles : écriture et relecture D1, écriture R2 (sous reports/), TCGdex. */

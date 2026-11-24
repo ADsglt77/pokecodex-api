@@ -15,6 +15,10 @@ sur un Worker Cloudflare indépendant (`pokecodex-importer`). Tout le fonctionne
 - Aucun secret dans Git : `ADMIN_TOKEN` est un secret Wrangler ; sa copie locale est
   `.secrets/admin-token.txt` (ignoré par Git). Ne jamais l'afficher dans une réponse.
 - Aucune donnée de marché : les objets `pricing` de TCGdex sont retirés avant stockage.
+- Ajouts hors TCGdex (copie Pokécardex du 28/10, autorisée par l'utilisateur le 23/11/2026) :
+  uniquement par `POST /admin/import/*`, qui n'écrase jamais rien. **Aucune image filigranée** :
+  chaque image est vérifiée carte par carte avant envoi ; en cas de doute, demander à l'utilisateur
+  (il a signalé des faux positifs). Aucun nom de source dans les ids ni les clés.
 
 ## Environnement
 
@@ -91,6 +95,7 @@ convertirait `/admin/…` en chemin Windows).
 `src/services/runner.ts` (exécuteur), `src/services/downloader.ts` (images), `src/services/media.ts`
 (petites images, logos et symboles), `src/services/catalog.ts` (catalogue, extensions, index),
 `src/services/cards.ts` (détails), `src/services/reports.ts` (audit et exports),
-`src/repositories/jobs.ts` (file de tâches), `migrations/` (schéma : `0001_initial.sql`,
-`0002_media.sql`, `0003_set_symbols.sql`), `tests/helpers.ts` (faux TCGdex, horloge simulée),
-`tests/media.test.ts`.
+`src/repositories/jobs.ts` (file de tâches), `src/services/manual-import.ts` (ajouts hors TCGdex),
+`migrations/` (schéma : `0001_initial.sql`, `0002_media.sql`, `0003_set_symbols.sql`,
+`0004_manual_sources.sql`), `tests/helpers.ts` (faux TCGdex, horloge simulée), `tests/media.test.ts`,
+`tests/manual-import.test.ts`, `scripts/pokecardex/prepare.mjs` et `scripts/import-manual.mjs`.

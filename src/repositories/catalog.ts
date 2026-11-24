@@ -190,7 +190,7 @@ export function upsertCardBriefsStmts(
        FROM json_each(?5) WHERE true
        ON CONFLICT (id) DO UPDATE SET name = excluded.name, local_id = excluded.local_id, set_id = excluded.set_id,
          series_id = COALESCE(excluded.series_id, cards.series_id), api_image_url = excluded.api_image_url,
-         brief_hash = excluded.brief_hash, removed_at = NULL, updated_at = excluded.updated_at
+         brief_hash = excluded.brief_hash, removed_at = NULL, data_source = NULL, updated_at = excluded.updated_at
        WHERE cards.brief_hash IS NOT excluded.brief_hash OR cards.removed_at IS NOT NULL
          OR cards.set_id IS NOT excluded.set_id
          OR (excluded.series_id IS NOT NULL AND cards.series_id IS NOT excluded.series_id)`,
