@@ -194,7 +194,10 @@ longueur annoncée, **MD5 = ETag** du CDN), puis écrite dans R2 avec le contrô
 d'extension en `application/octet-stream` (sondé le 14/11/2026), accepté pour eux seuls ; la
 signature, les tailles et le MD5 restent exigés. D1
 n'est mis à jour qu'une fois l'écriture confirmée. Aucun téléchargement corrompu ne peut donc écraser
-un objet. Les images ne sont ni recompressées ni modifiées. Le bucket reste **privé** : aucun domaine
+un objet. Les images ne sont ni recompressées ni modifiées, sauf les symboles copiés par
+`POST /admin/import/symbol` reçus en PNG (ou de plus de 512 px), que la liaison Images convertit en
+WebP : pour eux, `symbol_sha256` est l'empreinte du WebP stocké, celle du fichier d'origine est dans la
+métadonnée R2 `sourceSha256`. Le bucket reste **privé** : aucun domaine
 public n'est configuré (les images sont des œuvres protégées).
 
 ## Images manquantes
@@ -334,6 +337,7 @@ Ou avec curl : `curl -s -H "Authorization: Bearer $(cat .secrets/admin-token.txt
 | `POST /admin/selftest` | vérifie D1, R2 et l'accès à TCGdex |
 | `POST /admin/import/catalog` | ajoute séries, extensions et cartes d'une autre source (corps JSON, voir « Ajouts hors TCGdex ») ; ne modifie jamais une ligne existante |
 | `POST /admin/import/image` | envoie l'image d'une carte ou le logo d'une extension (corps WebP ; `?kind=main\|low\|logo&language=&target=&source=`) ; n'écrase jamais rien |
+| `POST /admin/import/symbol` | copie le symbole d'une extension qui n'en a pas : le Worker télécharge lui-même `source` (TCGdex `univ/…/symbol.png\|webp` ou Pokécardex `symboles[_jp]/<code>.png`), le convertit en WebP (liaison Images) ; `?language=&target=&source=` ; 424 si la source n'a pas le fichier, 502 si elle est en panne |
 
 ## Ajouts hors TCGdex (copie Pokécardex)
 
@@ -361,9 +365,23 @@ d'écarter Pokécardex). Rien n'est téléchargé : tout part de la copie locale
   comme pour TCGdex ; métadonnées R2 `source: pokecardex`, `sourceUrl`, `sha256` et l'identité
   attendue par les tâches (`tcgdexId`, `setId`) ; écriture conditionnelle (`onlyIf`) : un objet déjà
   présent n'est jamais remplacé (même contenu : réconcilié).
+- **Symboles d'extension** (`src/services/symbols.ts`, migration `0005_set_symbol_provider.sql` :
+  `sets.symbol_provider`, NULL = TCGdex, `'pokecardex'`) : seule exception au « rien n'est
+  téléchargé », autorisée par l'utilisateur le 24/11/2026 (la copie du 28/10 ne contient aucun
+  symbole). `POST /admin/import/symbol` fait télécharger le fichier par le Worker lui-même, sur deux
+  hôtes seulement, au chemin exact attendu : `assets.tcgdex.net/univ/<série>/<ext>/symbol.png|webp`
+  (PNG quand le WebP de l'API manque, symbole de l'extension mère ou de l'extension internationale
+  équivalente) et `pokecardex.b-cdn.net/assets/images/symboles[_jp]/<code>.png`. Contrôles : type,
+  signature PNG ou WebP, longueur annoncée, MD5 = ETag chez TCGdex, côté de 8 px au moins ; un PNG (ou
+  une image de plus de 512 px) est converti en WebP par la liaison Cloudflare Images (`IMAGES`, rien
+  n'est stocké chez Images), puis écrit à `cards/<l>/<ext>/_symbol.webp` (métadonnées `setId`,
+  `sourceUrl`, `sourceSha256`). Une extension qui a déjà un symbole n'est jamais touchée (aucune
+  requête) ; un échec de la source ne modifie pas D1 ; la tâche `symbol` de la synchronisation ne
+  remplace jamais un symbole copié.
 - **Scripts** : `scripts/pokecardex/prepare.mjs` construit les lots depuis la copie locale et les
   fichiers d'analyse (dans `.local/pokecardex/`, ignoré par Git) ; `scripts/import-manual.mjs`
-  (`catalog`, `logos`, `images`) les envoie, avec journal de reprise.
+  (`catalog`, `logos`, `images`) les envoie, avec journal de reprise ; `symbols <plan.json>` demande
+  au Worker chaque symbole, une adresse à la fois (3 s d'écart chez Pokécardex, 0,3 s chez TCGdex).
 - **Filigranes** : les scans de Pokécardex portent souvent un filigrane intégré (« POKÉCARDEX » en
   bande à mi-hauteur, en diagonale, ou « pokecardex.com ») ; les rendus numériques officiels sont
   propres, mais dans beaucoup d'extensions japonaises les cartes secrètes (UR dorées) sont des scans
@@ -374,6 +392,10 @@ d'écarter Pokécardex). Rien n'est téléchargé : tout part de la copie locale
   13 997 images (FR 524, JA 13 473) ; 618 images filigranées et 7 cartes BWP portant un texte ajouté
   (« Carte jamais… ») écartées. Les cartes ajoutées sans image propre sont en `missing_api_url`
   (motif « aucune image propre disponible »).
+- **Symboles du 24/11/2026** : 534 copiés (48 depuis TCGdex, 486 depuis Pokécardex), soit 650
+  extensions sur 684 avec un symbole. Les 34 restantes n'ont aucune source retenue (pas de symbole
+  imprimé, extensions vides, TCG Pocket). Plan, journal et liste des 106 symboles à revoir à l'œil
+  (tailles anormales, icônes communes, équivalences déduites) : `.local/pokecardex/symboles/`.
 
 ## Estimation des coûts
 

@@ -9,8 +9,9 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { handleAdmin, type AdminDeps } from '../src/admin/router'
 import { Db } from '../src/db'
 import { importCatalog, InputError, numberKey, parseCatalogBatch, setKey } from '../src/services/manual-import'
+import type { SymbolImages } from '../src/services/symbols'
 import { retryMissing, startSync } from '../src/services/sync'
-import { Clock, drain, makeDeps, one, resetAll, rows, sampleCatalog, sha256Hex, webp, type FakeTcgdex } from './helpers'
+import { ASSETS, Clock, drain, makeDeps, one, resetAll, rows, sampleCatalog, sha256Hex, webp, type FakeTcgdex } from './helpers'
 
 const TOKEN = env.ADMIN_TOKEN
 const ORIGIN = 'https://importateur.test'
@@ -308,5 +309,197 @@ describe('cohabitation avec la synchronisation TCGdex', () => {
       listed: 1,
     })
     expect(await rows(`SELECT key FROM import_jobs WHERE status = 'failed'`).catch(() => [])).toEqual([])
+  })
+})
+
+// ——— Symboles d'extension (POST /admin/import/symbol) ———
+
+const PCX = 'https://pokecardex.b-cdn.net/assets/images'
+
+/** Un PNG minimal (signature et en-tête IHDR) de `width`×`height`, complété à `size` octets. */
+function png(width: number, height: number, size = 300): Uint8Array {
+  const bytes = new Uint8Array(size)
+  const view = new DataView(bytes.buffer)
+  bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0)
+  view.setUint32(8, 13)
+  bytes.set([0x49, 0x48, 0x44, 0x52], 12) // IHDR
+  view.setUint32(16, width)
+  view.setUint32(20, height)
+  for (let i = 24; i < size; i++) bytes[i] = i & 0xff
+  return bytes
+}
+
+/** Imitation de la liaison Images : dimensions lues dans l'en-tête, WebP de sortie déterministe. */
+const converted: Uint8Array[] = []
+const fakeImages: SymbolImages = {
+  async info(bytes) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    if (bytes[0] === 0x89) return { format: 'image/png', width: view.getUint32(16), height: view.getUint32(20) }
+    if (String.fromCharCode(...bytes.subarray(8, 12)) === 'WEBP') return { format: 'image/webp', width: 64, height: 64 }
+    throw new Error('pas une image')
+  },
+  async toWebp(bytes) {
+    converted.push(bytes)
+    return webp(320, 9)
+  },
+}
+
+function symbol(language: string, target: string, source: string): Promise<Response> {
+  const deps = makeDeps(fake, clock)
+  const query = new URLSearchParams({ language, target, source })
+  return handleAdmin(new Request(`${ORIGIN}/admin/import/symbol?${query}`, { method: 'POST', headers: { authorization: `Bearer ${TOKEN}` } }), {
+    config: deps.config,
+    d1: env.DB,
+    bucket: env.BUCKET,
+    fetcher: fake.fetcher,
+    adminToken: TOKEN,
+    now: clock.now,
+    symbolImages: fakeImages,
+  })
+}
+
+const respond =
+  (body: BodyInit | null, status = 200, headers: Record<string, string> = { 'content-type': 'image/png' }) =>
+  (): Response =>
+    new Response(body, { status, headers })
+
+const symbolRow = (id: string) =>
+  one(`SELECT symbol_status, symbol_r2_key, symbol_source_url, symbol_file_size, symbol_provider, symbol_failure_reason FROM sets WHERE id = ?1`, id)
+
+describe('POST /admin/import/symbol', () => {
+  beforeEach(() => {
+    converted.length = 0
+  })
+
+  it('schéma (migration 0005) : symbol_provider NULL par défaut, limité à pokecardex', async () => {
+    expect(await one(`SELECT COUNT(*) AS n FROM sets WHERE symbol_provider IS NOT NULL`)).toEqual({ n: 0 })
+    await expect(env.DB.prepare(`UPDATE sets SET symbol_provider = 'tcgdex' WHERE id = 'fr:swsh3'`).run()).rejects.toThrow(/CHECK constraint failed/)
+  })
+
+  it('Pokécardex : PNG téléchargé par le Worker, converti en WebP, marqué pokecardex, jamais recopié', async () => {
+    const url = `${PCX}/symboles_jp/SV1A.png`
+    const source = png(54, 31)
+    fake.queue(url, respond(source, 200, { 'content-type': 'image/png', 'content-length': String(source.byteLength) }))
+    const res = await symbol('ja', 'SV1a', url)
+    expect(res.status).toBe(201)
+    expect(await res.json()).toMatchObject({ status: 'stored', key: 'cards/ja/SV1a/_symbol.webp', size: 320 })
+    expect(converted).toEqual([source])
+    expect(await symbolRow('ja:SV1a')).toEqual({
+      symbol_status: 'downloaded',
+      symbol_r2_key: 'cards/ja/SV1a/_symbol.webp',
+      symbol_source_url: url,
+      symbol_file_size: 320,
+      symbol_provider: 'pokecardex',
+      symbol_failure_reason: null,
+    })
+    const object = await env.BUCKET.head('cards/ja/SV1a/_symbol.webp')
+    expect(object?.httpMetadata?.contentType).toBe('image/webp')
+    expect(object?.customMetadata).toMatchObject({ variant: 'symbol', setId: 'SV1a', source: 'pokecardex', sourceUrl: url, sha256: await sha256Hex(webp(320, 9)), sourceSha256: await sha256Hex(source) })
+    const request = fake.requests.find((item) => item.url === url)
+    expect(request?.headers).toMatchObject({ accept: 'image/png', 'user-agent': 'pokecodex-importer/1.0' })
+
+    // Déjà présent : rien n'est retéléchargé ni réécrit.
+    expect(await symbol('ja', 'SV1a', url).then((r) => r.json())).toMatchObject({ status: 'unchanged' })
+    expect(fake.count((item) => item === url)).toBe(1)
+  })
+
+  it('TCGdex : PNG à la place du WebP introuvable ; la synchronisation ne le remplace jamais', async () => {
+    const base = `${ASSETS}/univ/swsh/swsh3/symbol`
+    fake.sets.fr[0]!.symbol = base
+    const deps = makeDeps(fake, clock)
+    clock.advance(8 * 86_400_000)
+    await startSync(new Db(env.DB), deps.config, clock.now(), { languages: ['fr'], scope: {} })
+    await drain(deps, clock)
+    expect(await symbolRow('fr:swsh3')).toMatchObject({ symbol_status: 'not_found_on_cdn', symbol_provider: null })
+
+    fake.addImage(`${base}.png`, png(120, 120), { headers: { 'content-type': 'image/png' } })
+    const res = await symbol('fr', 'swsh3', `${base}.png`)
+    expect(res.status).toBe(201)
+    expect(await symbolRow('fr:swsh3')).toEqual({
+      symbol_status: 'downloaded',
+      symbol_r2_key: 'cards/fr/swsh3/_symbol.webp',
+      symbol_source_url: `${base}.png`,
+      symbol_file_size: 320,
+      symbol_provider: null,
+      symbol_failure_reason: null,
+    })
+    expect((await env.BUCKET.head('cards/fr/swsh3/_symbol.webp'))?.customMetadata?.source).toBeUndefined()
+
+    const webpRequests = fake.count((url) => url === `${base}.webp`)
+    clock.advance(31 * 86_400_000)
+    await startSync(new Db(env.DB), deps.config, clock.now(), { languages: ['fr'], scope: {} })
+    await drain(deps, clock)
+    expect(await symbolRow('fr:swsh3')).toMatchObject({ symbol_status: 'downloaded', symbol_source_url: `${base}.png`, symbol_file_size: 320 })
+    expect(fake.count((url) => url === `${base}.webp`)).toBe(webpRequests)
+  })
+
+  it('WebP de TCGdex (symbole de l’extension mère) : copié tel quel, sans conversion', async () => {
+    const url = `${ASSETS}/univ/swsh/swsh2/symbol.webp`
+    fake.addImage(url, webp(352, 4), { headers: { 'content-type': 'application/octet-stream' } })
+    const res = await symbol('fr', 'exu', url)
+    expect(res.status).toBe(201)
+    expect(await res.json()).toMatchObject({ status: 'stored', size: 352, sha256: await sha256Hex(webp(352, 4)) })
+    expect(converted).toEqual([])
+    expect(await symbolRow('fr:exu')).toMatchObject({ symbol_status: 'downloaded', symbol_provider: null, symbol_file_size: 352 })
+  })
+
+  it('refuse tout autre hôte ou chemin, sans aucune requête', async () => {
+    const before = fake.requests.length
+    for (const source of [
+      'https://images.pokemontcg.io/base1/symbol.png',
+      'http://pokecardex.b-cdn.net/assets/images/symboles/BS.png',
+      'https://pokecardex.b-cdn.net:8443/assets/images/symboles/BS.png',
+      `${PCX}/symboles/BS.png?class=hd`,
+      `${PCX}/symboles/BS.png#x`,
+      `${PCX}/logos/BS.png`,
+      `${PCX}/symboles/../logos/BS.png`,
+      `${PCX}/symboles/BS.webp`,
+      `${ASSETS}/fr/swsh/swsh3/symbol.png`,
+      `${ASSETS}/univ/swsh/swsh3/logo.png`,
+      '',
+    ]) {
+      expect((await symbol('ja', 'SV1a', source)).status, source).toBe(400)
+    }
+    expect((await symbol('de', 'SV1a', `${PCX}/symboles_jp/SV1A.png`)).status).toBe(400)
+    expect((await symbol('ja', 'ZZZ', `${PCX}/symboles_jp/ZZZ.png`)).status).toBe(404)
+    expect(fake.requests.length).toBe(before)
+    expect(await symbolRow('ja:SV1a')).toMatchObject({ symbol_status: null, symbol_r2_key: null })
+  })
+
+  it('source absente, refusée, en panne ou fichier invalide : D1 et R2 inchangés', async () => {
+    const url = `${PCX}/symboles_jp/SV1A.png`
+    const cases: [() => Response, number, string][] = [
+      [respond('absent', 404, { 'content-type': 'text/html' }), 424, 'source_not_found'],
+      [respond(null, 301, { location: 'https://ailleurs.test/x.png' }), 424, 'source_refused'],
+      [respond('panne', 503, { 'content-type': 'text/plain' }), 502, 'source_error'],
+      [respond('<html></html>', 200, { 'content-type': 'text/html' }), 422, 'invalid'],
+      [respond(new Uint8Array(300).fill(7)), 422, 'invalid'],
+      [respond(png(1, 1)), 422, 'invalid'],
+      [respond(png(40, 40, 60)), 422, 'invalid'],
+      [respond(png(40, 40), 200, { 'content-type': 'image/png', 'content-length': '999' }), 502, 'source_error'],
+    ]
+    for (const [responder, status, outcome] of cases) {
+      fake.queue(url, responder)
+      const res = await symbol('ja', 'SV1a', url)
+      expect(res.status).toBe(status)
+      expect(await res.json()).toMatchObject({ status: outcome })
+    }
+    expect(await symbolRow('ja:SV1a')).toMatchObject({ symbol_status: null, symbol_r2_key: null, symbol_provider: null })
+    expect((await env.BUCKET.list({ prefix: 'cards/ja/SV1a/_symbol' })).objects).toEqual([])
+    expect(converted).toEqual([])
+  })
+
+  it('objet R2 déjà présent : réconcilié s’il est le symbole de l’extension, sinon jamais écrasé', async () => {
+    const url = `${PCX}/symboles_jp/SV1A.png`
+    await env.BUCKET.put('cards/ja/SV1a/_symbol.webp', webp(200, 3), { customMetadata: { setId: 'autre', sha256: 'x' } })
+    expect((await symbol('ja', 'SV1a', url)).status).toBe(409)
+    expect((await env.BUCKET.head('cards/ja/SV1a/_symbol.webp'))?.size).toBe(200)
+
+    await env.BUCKET.put('cards/ja/SV1a/_symbol.webp', webp(250, 3), { customMetadata: { setId: 'SV1a', sha256: 'abc', source: 'pokecardex', sourceUrl: url } })
+    const res = await symbol('ja', 'SV1a', url)
+    expect(res.status).toBe(200)
+    expect(await res.json()).toMatchObject({ status: 'reconciled', size: 250 })
+    expect(await symbolRow('ja:SV1a')).toMatchObject({ symbol_status: 'downloaded', symbol_file_size: 250, symbol_provider: 'pokecardex', symbol_source_url: url })
+    expect(fake.count((item) => item === url)).toBe(0)
   })
 })

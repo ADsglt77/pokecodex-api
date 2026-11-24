@@ -56,11 +56,14 @@ export interface LanguageStats {
   symbolsErrors: number
   symbolsPending: number
   symbolBytes: number
+  /** Toutes les extensions de la langue (dénominateur des symboles, quelle que soit leur source). */
+  setsTotal: number
   /** Lignes et images ajoutées par l'API d'import (autre source que TCGdex : `data_source`, `*_provider`). */
   manualSets: number
   manualCards: number
   manualImages: number
   manualLogos: number
+  manualSymbols: number
 }
 
 export interface JobCount {
@@ -146,11 +149,13 @@ async function languageStats(db: Db, language: Language): Promise<LanguageStats>
        (SELECT COUNT(*) FROM sets WHERE language = ?1 AND symbol_status IN ('download_error', 'invalid_image')) AS symbolsErrors,
        (SELECT COUNT(*) FROM sets WHERE language = ?1 AND symbol_url IS NOT NULL AND symbol_status IS NULL) AS symbolsPending,
        (SELECT COALESCE(SUM(symbol_file_size), 0) FROM sets WHERE language = ?1 AND symbol_status = 'downloaded') AS symbolBytes,
+       (SELECT COUNT(*) FROM sets WHERE language = ?1) AS setsTotal,
        (SELECT COUNT(*) FROM sets WHERE language = ?1 AND data_source IS NOT NULL) AS manualSets,
        COALESCE(SUM(removed_at IS NULL AND data_source IS NOT NULL), 0) AS manualCards,
        COALESCE(SUM(removed_at IS NULL AND image_provider IS NOT NULL
          AND image_status IN ('downloaded', 'recovered_from_cdn', 'already_present')), 0) AS manualImages,
-       (SELECT COUNT(*) FROM sets WHERE language = ?1 AND logo_provider IS NOT NULL AND logo_status = 'downloaded') AS manualLogos
+       (SELECT COUNT(*) FROM sets WHERE language = ?1 AND logo_provider IS NOT NULL AND logo_status = 'downloaded') AS manualLogos,
+       (SELECT COUNT(*) FROM sets WHERE language = ?1 AND symbol_provider IS NOT NULL AND symbol_status = 'downloaded') AS manualSymbols
      FROM cards WHERE language = ?1`,
     language,
   )
@@ -274,9 +279,10 @@ export function formatStatus(stats: Stats): string {
       `${pad('Petites images (low)')}: ${n(lang.lowImagesStored)} / ${n(lang.imagesStored)} (introuvables ${n(lang.lowImagesMissing)}, erreurs ${n(lang.lowImagesErrors)}, à faire ${n(lang.lowImagesPending)})`,
       // Logos copiés de TCGdex / extensions dont TCGdex donne un logo ; les ajouts sont comptés à part.
       `${pad('Logos d’extension')}: ${n(lang.logosStored - lang.manualLogos)} / ${n(lang.setsWithLogo)} (introuvables ${n(lang.logosMissing)}, erreurs ${n(lang.logosErrors)}, à faire ${n(lang.logosPending)})`,
-      `${pad('Symboles d’extension')}: ${n(lang.symbolsStored)} / ${n(lang.setsWithSymbol)} (introuvables ${n(lang.symbolsMissing)}, erreurs ${n(lang.symbolsErrors)}, à faire ${n(lang.symbolsPending)})`,
-      ...(lang.manualCards || lang.manualSets || lang.manualImages || lang.manualLogos
-        ? [`${pad('Ajouts hors TCGdex')}: ${n(lang.manualSets)} extensions, ${n(lang.manualCards)} cartes, ${n(lang.manualImages)} images, ${n(lang.manualLogos)} logos`]
+      // Symboles copiés (toutes sources : tâche TCGdex et `POST /admin/import/symbol`) / toutes les extensions.
+      `${pad('Symboles d’extension')}: ${n(lang.symbolsStored)} / ${n(lang.setsTotal)} (introuvables ${n(lang.symbolsMissing)}, erreurs ${n(lang.symbolsErrors)}, à faire ${n(lang.symbolsPending)})`,
+      ...(lang.manualCards || lang.manualSets || lang.manualImages || lang.manualLogos || lang.manualSymbols
+        ? [`${pad('Ajouts hors TCGdex')}: ${n(lang.manualSets)} extensions, ${n(lang.manualCards)} cartes, ${n(lang.manualImages)} images, ${n(lang.manualLogos)} logos, ${n(lang.manualSymbols)} symboles`]
         : []),
       '',
     )

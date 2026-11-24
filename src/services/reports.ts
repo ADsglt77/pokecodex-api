@@ -294,7 +294,7 @@ async function auditR2(ctx: JobContext, config: Config): Promise<AuditResult> {
     statements.push(
       db.stmt(
         `UPDATE sets SET ${kind}_status = NULL, ${kind}_r2_key = NULL, ${kind}_file_size = NULL, ${kind}_sha256 = NULL,
-           ${kind}_checked_at = NULL, ${kind}_failure_reason = 'objet absent de R2 (audit)', updated_at = ?1
+           ${kind}_checked_at = NULL, ${kind}_provider = NULL, ${kind}_failure_reason = 'objet absent de R2 (audit)', updated_at = ?1
          WHERE id IN (SELECT value FROM json_each(?2))`,
         iso(nowMs),
         JSON.stringify(lost.map((set) => set.id)),

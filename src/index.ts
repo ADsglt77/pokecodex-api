@@ -12,6 +12,7 @@ import { handleAdmin, json } from './admin/router'
 import { parseConfig, type Config, type ConfigSource } from './config'
 import { Db } from './db'
 import { runTick } from './services/runner'
+import { imagesBindingAdapter } from './services/symbols'
 import { startSync } from './services/sync'
 import { log, logError } from './utils/log'
 
@@ -27,13 +28,15 @@ export default {
     const url = new URL(request.url)
     if (url.pathname === '/health') return new Response('ok\n', { headers: { 'content-type': 'text/plain', 'cache-control': 'no-store' } })
     if (url.pathname === '/admin' || url.pathname.startsWith('/admin/')) {
+      const config = configFromEnv(env)
       return handleAdmin(request, {
-        config: configFromEnv(env),
+        config,
         d1: env.DB,
         bucket: env.BUCKET,
         fetcher: (input, init) => fetch(input, init),
         adminToken: env.ADMIN_TOKEN,
         waitUntil: (promise) => ctx.waitUntil(promise),
+        symbolImages: imagesBindingAdapter(env.IMAGES, config.maxImageBytes),
       })
     }
     return json({ error: 'route inconnue' }, 404)

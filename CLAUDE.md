@@ -18,7 +18,9 @@ sur un Worker Cloudflare indépendant (`pokecodex-importer`). Tout le fonctionne
 - Ajouts hors TCGdex (copie Pokécardex du 28/10, autorisée par l'utilisateur le 23/11/2026) :
   uniquement par `POST /admin/import/*`, qui n'écrase jamais rien. **Aucune image filigranée** :
   chaque image est vérifiée carte par carte avant envoi ; en cas de doute, demander à l'utilisateur
-  (il a signalé des faux positifs). Aucun nom de source dans les ids ni les clés.
+  (il a signalé des faux positifs). Aucun nom de source dans les ids ni les clés. Seule exception
+  au « rien n'est téléchargé » : les symboles d'extension (`POST /admin/import/symbol`, autorisé le
+  24/11/2026), que le Worker télécharge lui-même chez TCGdex ou Pokécardex (`src/services/symbols.ts`).
 
 ## Environnement
 
@@ -58,7 +60,12 @@ convertirait `/admin/…` en chemin Windows).
   verrou de tâche ≥ verrou de l'exécuteur ; le verrou de l'exécuteur est renouvelé dans le batch de
   chaque lot. Une tâche rendue (429, dépendance) l'est `MAX_RELEASES` fois au plus.
 - **Réseau** : aucune redirection suivie (`redirect: 'manual'`), seuls `api.tcgdex.net` et
-  `assets.tcgdex.net` en https ; une URL d'image officielle d'une autre langue est ignorée.
+  `assets.tcgdex.net` en https ; une URL d'image officielle d'une autre langue est ignorée. Exception
+  unique : `POST /admin/import/symbol` contacte aussi `pokecardex.b-cdn.net`, au chemin exact
+  `/assets/images/symboles[_jp]/<code>.png` (`SYMBOL_SOURCES`), une adresse par appel.
+- **Liaison Images** (`IMAGES`) : seulement pour convertir en WebP les symboles reçus en PNG ;
+  facturée par transformation unique (5 000 incluses par mois). Après tout changement de
+  `wrangler.jsonc`, `npx wrangler types`.
 - **TCGdex** (sondé le 13/11/2026) : pas de limite publiée mais « be considerate » (≤ 4 requêtes/s) ;
   encoder chaque segment d'URL (`exu-%3F` → `exu-%253F`, `SM1+` → `SM1%2B`) ; l'API renvoie parfois
   des 503 de quelques secondes ; le CDN `assets.tcgdex.net` (nginx + S3, pas Cloudflare) renvoie de
@@ -96,6 +103,8 @@ convertirait `/admin/…` en chemin Windows).
 (petites images, logos et symboles), `src/services/catalog.ts` (catalogue, extensions, index),
 `src/services/cards.ts` (détails), `src/services/reports.ts` (audit et exports),
 `src/repositories/jobs.ts` (file de tâches), `src/services/manual-import.ts` (ajouts hors TCGdex),
+`src/services/symbols.ts` (symboles copiés par l'API d'import),
 `migrations/` (schéma : `0001_initial.sql`, `0002_media.sql`, `0003_set_symbols.sql`,
-`0004_manual_sources.sql`), `tests/helpers.ts` (faux TCGdex, horloge simulée), `tests/media.test.ts`,
+`0004_manual_sources.sql`, `0005_set_symbol_provider.sql`), `tests/helpers.ts` (faux TCGdex, horloge
+simulée), `tests/media.test.ts`,
 `tests/manual-import.test.ts`, `scripts/pokecardex/prepare.mjs` et `scripts/import-manual.mjs`.

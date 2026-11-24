@@ -21,6 +21,9 @@
   // Bucket existant, réutilisé : l'importateur n'écrit que sous `cards/` (images) et `reports/`
   // (rapports). Le bucket reste privé : aucun domaine public n'est configuré.
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pokedex-data" }],
+  // Cloudflare Images : conversion en WebP des symboles d'extension fournis en PNG
+  // (`POST /admin/import/symbol`) ; rien n'est stocké chez Images, le résultat va dans R2.
+  "images": { "binding": "IMAGES" },
   "triggers": {
     // Toutes les 5 minutes : traitement des tâches en attente (une exécution à la fois, verrou D1).
     // Le lundi à 03:07 UTC (hors des multiples de 5, pour ne pas croiser le traitement) :

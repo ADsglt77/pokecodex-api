@@ -1654,8 +1654,9 @@ describe('statut, erreurs et audit', () => {
 
     const text = await (await admin(deps, fake, 'GET', '/admin/status')).text()
     const sections = new Map(text.trimEnd().split('\n\n').map((block) => [block.split('\n')[0] ?? '', block]))
-    expect(sections.get('FRANÇAIS')).toMatch(/^Symboles d’extension\s*: 1 \/ 1 \(introuvables 0, erreurs 0, à faire 0\)$/m)
-    expect(sections.get('JAPONAIS')).toMatch(/^Symboles d’extension\s*: 0 \/ 1 \(introuvables 1, erreurs 0, à faire 0\)$/m)
+    // Symboles copiés / toutes les extensions de la langue (2 de chaque côté, une seule avec un symbole).
+    expect(sections.get('FRANÇAIS')).toMatch(/^Symboles d’extension\s*: 1 \/ 2 \(introuvables 0, erreurs 0, à faire 0\)$/m)
+    expect(sections.get('JAPONAIS')).toMatch(/^Symboles d’extension\s*: 0 \/ 2 \(introuvables 1, erreurs 0, à faire 0\)$/m)
     expect(sections.get('TOTAL')).toMatch(/^Symboles R2\s*: 1$/m)
   })
 
@@ -1746,6 +1747,8 @@ describe('schéma (migration 0003)', () => {
       ['symbol_file_size', 'INTEGER', 0, null],
       ['symbol_sha256', 'TEXT', 0, null],
       ['symbol_failure_reason', 'TEXT', 0, null],
+      // Ajoutée par 0005_set_symbol_provider.sql (symboles copiés par l'API d'import).
+      ['symbol_provider', 'TEXT', 0, null],
     ])
     for (const status of ['downloaded', 'not_found_on_cdn', 'missing_api_url', 'download_error', 'invalid_image', null]) {
       await env.DB.prepare(`UPDATE sets SET symbol_status = ?1 WHERE id = 'fr:swsh3'`).bind(status).run()

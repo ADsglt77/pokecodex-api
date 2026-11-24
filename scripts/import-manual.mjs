@@ -7,6 +7,9 @@
  *   node scripts/import-manual.mjs catalog <dossier des lots>        lots catalog-*.json, dans l'ordre
  *   node scripts/import-manual.mjs logos <logos.json>                [{ language, set, file, source }]
  *   node scripts/import-manual.mjs images <images.json>              [{ language, card, hd, md, source }]
+ *   node scripts/import-manual.mjs symbols <plan.json>               { extensions: [{ id, source, url }] } :
+ *        le Worker télécharge lui-même chaque symbole (aucun fichier ne passe par ce poste), une adresse
+ *        à la fois, 3 s d'écart chez Pokécardex et 0,3 s chez TCGdex
  *
  * Jeton et adresse : comme scripts/admin.mjs (`.secrets/`, jamais affichés).
  */
@@ -31,7 +34,7 @@ const [mode, input] = process.argv.slice(2)
 const CONCURRENCY = Number(process.env.CONCURRENCY ?? 4)
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-async function post(route, body, contentType) {
+async function post(route, body, contentType, maxAttempts = 6) {
   for (let attempt = 1; ; attempt++) {
     try {
       const res = await fetch(`${base}${route}`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': contentType }, body })
@@ -43,13 +46,13 @@ async function post(route, body, contentType) {
         json = { error: text.slice(0, 300) }
       }
       // Erreurs passagères (5xx, limite) : nouvelle tentative avec attente croissante.
-      if ((res.status >= 500 || res.status === 429) && attempt < 6) {
+      if ((res.status >= 500 || res.status === 429) && attempt < maxAttempts) {
         await sleep(2_000 * attempt)
         continue
       }
       return { status: res.status, json }
     } catch (error) {
-      if (attempt >= 6) return { status: 0, json: { error: String(error) } }
+      if (attempt >= maxAttempts) return { status: 0, json: { error: String(error) } }
       await sleep(2_000 * attempt)
     }
   }
@@ -134,6 +137,45 @@ if (mode === 'catalog') {
     if (++seen % 500 === 0) console.log(`${seen} / ${items.length}`, JSON.stringify(counts))
   })
   console.log(JSON.stringify(counts))
+} else if (mode === 'symbols') {
+  // Seules les deux sources acceptées par le Worker ; une adresse à la fois, au rythme de chaque hôte.
+  const DELAY_MS = { 'pokecardex.b-cdn.net': 3_000, 'assets.tcgdex.net': 300 }
+  const plan = JSON.parse(readFileSync(input, 'utf8')).extensions
+  const items = plan.filter((item) => item.url && new URL(item.url).host in DELAY_MS)
+  console.log(`${items.length} symboles à demander ; ${plan.length - items.length} entrées du plan écartées (sans adresse ou autre hôte)`)
+  // Journal : dernier résultat de chaque extension. Une extension réussie n'est jamais redemandée ;
+  // un échec définitif (fichier absent, invalide) seulement tant que l'adresse du plan est la même.
+  const logFile = input.replace(/\.json$/, '.journal.jsonl')
+  const last = new Map()
+  if (existsSync(logFile)) for (const line of readFileSync(logFile, 'utf8').split('\n')) if (line) last.set(JSON.parse(line).id, JSON.parse(line))
+  const SUCCESS = ['stored', 'reconciled', 'unchanged', 'conflict', 'not_found']
+  const counts = {}
+  let seen = 0
+  let refusals = 0
+  for (const item of items) {
+    const previous = last.get(item.id)
+    if (previous?.final && (SUCCESS.includes(previous.result) || previous.url === item.url)) continue
+    const split = item.id.indexOf(':')
+    const query = new URLSearchParams({ language: item.id.slice(0, split), target: item.id.slice(split + 1), source: item.url })
+    // Une seule tentative : une panne (502) reste « non finie » dans le journal et sera reprise au
+    // prochain lancement, sans jamais relancer la source plus vite que son rythme.
+    const { status, json } = await post(`/admin/import/symbol?${query}`, undefined, 'application/json', 1)
+    // Refus (403…) et pannes ne sont jamais définitifs : ils seront redemandés au prochain lancement.
+    const final = [...SUCCESS, 'invalid', 'source_not_found'].includes(json.status)
+    appendFileSync(logFile, `${JSON.stringify({ id: item.id, url: item.url, status, result: json.status ?? null, reason: json.reason ?? json.error ?? null, key: json.key ?? null, final })}\n`)
+    const key = json.status ?? `http_${status}`
+    counts[key] = (counts[key] ?? 0) + 1
+    if (++seen % 50 === 0) console.log(`${seen} / ${items.length}`, JSON.stringify(counts))
+    // Source qui refuse, limite ou tombe : arrêt après 3 réponses de suite, ou dès un 429.
+    refusals = ['source_refused', 'source_error'].includes(json.status) || status >= 500 ? refusals + 1 : 0
+    if (json.httpStatus === 429 || refusals >= 3) {
+      console.log(`arrêt : la source refuse ou ne répond plus (${json.reason ?? json.error ?? `HTTP ${status}`})`)
+      break
+    }
+    // Attente pleine après chaque réponse qui a pu contacter la source (jamais moins que son rythme).
+    if (!['unchanged', 'reconciled', 'conflict', 'not_found'].includes(json.status)) await sleep(DELAY_MS[new URL(item.url).host])
+  }
+  console.log(JSON.stringify(counts))
 } else {
-  throw new Error('mode : catalog, logos ou images')
+  throw new Error('mode : catalog, logos, images ou symbols')
 }

@@ -13,6 +13,9 @@
  *   série TCGdex existante de la même langue ;
  * - lignes marquées `data_source = 'pokecardex'`, `brief_hash` NULL (jamais retirées par la
  *   synchronisation TCGdex) ; images et logos marqués `image_provider` / `logo_provider`.
+ *
+ * Les symboles d'extension suivent les mêmes règles, mais le Worker les télécharge lui-même
+ * (`symbols.ts`) : aucun fichier ne transite par le poste.
  */
 
 import { IMAGES_PREFIX, type Config, type Language } from '../config'

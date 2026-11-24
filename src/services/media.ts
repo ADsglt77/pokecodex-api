@@ -87,6 +87,9 @@ async function copyWebp(ctx: JobContext, url: string, key: string, customMetadat
       sha256: check.sha256,
       httpMetadata: { contentType: 'image/webp', cacheControl: 'public, max-age=31536000, immutable' },
       customMetadata: { ...customMetadata, sourceUrl: url, sha256: check.sha256, md5: check.md5 },
+      // Écriture conditionnelle : un objet apparu entre-temps (copie de `POST /admin/import/symbol`,
+      // par exemple) n'est jamais remplacé ; la tâche, rendue, le réconciliera au passage suivant.
+      onlyIf: { etagDoesNotMatch: '*' },
     })
   } catch (error) {
     return { kind: 'transient', reason: `écriture R2 échouée : ${errorMessage(error)}`, httpStatus: null }
