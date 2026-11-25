@@ -10,6 +10,8 @@
  *   node scripts/import-manual.mjs symbols <plan.json>               { extensions: [{ id, source, url }] } :
  *        le Worker télécharge lui-même chaque symbole (aucun fichier ne passe par ce poste), une adresse
  *        à la fois, 3 s d'écart chez Pokécardex et 0,3 s chez TCGdex
+ *   node scripts/import-manual.mjs logo-urls <plan.json>             même format et même rythme, pour les
+ *        logos (`POST /admin/import/logo`)
  *
  * Jeton et adresse : comme scripts/admin.mjs (`.secrets/`, jamais affichés).
  */
@@ -137,18 +139,21 @@ if (mode === 'catalog') {
     if (++seen % 500 === 0) console.log(`${seen} / ${items.length}`, JSON.stringify(counts))
   })
   console.log(JSON.stringify(counts))
-} else if (mode === 'symbols') {
-  // Seules les deux sources acceptées par le Worker ; une adresse à la fois, au rythme de chaque hôte.
-  const DELAY_MS = { 'pokecardex.b-cdn.net': 3_000, 'assets.tcgdex.net': 300 }
+} else if (mode === 'symbols' || mode === 'logo-urls') {
+  // Seules les sources acceptées par le Worker ; une adresse à la fois, au rythme de chaque hôte.
+  const route = mode === 'symbols' ? '/admin/import/symbol' : '/admin/import/logo'
+  const noun = mode === 'symbols' ? 'symboles' : 'logos'
+  const DELAY_MS = { 'pokecardex.b-cdn.net': 3_000, 'assets.tcgdex.net': 300, 'www.pokepedia.fr': 1_000, 'media.52poke.com': 1_000, 'archives.bulbagarden.net': 1_000 }
   const plan = JSON.parse(readFileSync(input, 'utf8')).extensions
   const items = plan.filter((item) => item.url && new URL(item.url).host in DELAY_MS)
-  console.log(`${items.length} symboles à demander ; ${plan.length - items.length} entrées du plan écartées (sans adresse ou autre hôte)`)
+  console.log(`${items.length} ${noun} à demander ; ${plan.length - items.length} entrées du plan écartées (sans adresse ou autre hôte)`)
   // Journal : dernier résultat de chaque extension. Une extension réussie n'est jamais redemandée ;
   // un échec définitif (fichier absent, invalide) seulement tant que l'adresse du plan est la même.
   const logFile = input.replace(/\.json$/, '.journal.jsonl')
   const last = new Map()
   if (existsSync(logFile)) for (const line of readFileSync(logFile, 'utf8').split('\n')) if (line) last.set(JSON.parse(line).id, JSON.parse(line))
-  const SUCCESS = ['stored', 'reconciled', 'unchanged', 'conflict', 'not_found']
+  // `not_found` (extension pas encore créée) n'est pas définitif : redemandé au prochain lancement.
+  const SUCCESS = ['stored', 'reconciled', 'unchanged', 'conflict']
   const counts = {}
   let seen = 0
   let refusals = 0
@@ -159,7 +164,7 @@ if (mode === 'catalog') {
     const query = new URLSearchParams({ language: item.id.slice(0, split), target: item.id.slice(split + 1), source: item.url })
     // Une seule tentative : une panne (502) reste « non finie » dans le journal et sera reprise au
     // prochain lancement, sans jamais relancer la source plus vite que son rythme.
-    const { status, json } = await post(`/admin/import/symbol?${query}`, undefined, 'application/json', 1)
+    const { status, json } = await post(`${route}?${query}`, undefined, 'application/json', 1)
     // Refus (403…) et pannes ne sont jamais définitifs : ils seront redemandés au prochain lancement.
     const final = [...SUCCESS, 'invalid', 'source_not_found'].includes(json.status)
     appendFileSync(logFile, `${JSON.stringify({ id: item.id, url: item.url, status, result: json.status ?? null, reason: json.reason ?? json.error ?? null, key: json.key ?? null, final })}\n`)
@@ -177,5 +182,5 @@ if (mode === 'catalog') {
   }
   console.log(JSON.stringify(counts))
 } else {
-  throw new Error('mode : catalog, logos, images ou symbols')
+  throw new Error('mode : catalog, logos, images, symbols ou logo-urls')
 }

@@ -9,7 +9,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { handleAdmin, type AdminDeps } from '../src/admin/router'
 import { Db } from '../src/db'
 import { importCatalog, InputError, numberKey, parseCatalogBatch, setKey } from '../src/services/manual-import'
-import type { SymbolImages } from '../src/services/symbols'
+import { LOGO_MAX_SIDE, SYMBOL_MAX_SIDE, type SetMediaImages } from '../src/services/set-media-import'
 import { retryMissing, startSync } from '../src/services/sync'
 import { ASSETS, Clock, drain, makeDeps, one, resetAll, rows, sampleCatalog, sha256Hex, webp, type FakeTcgdex } from './helpers'
 
@@ -329,34 +329,42 @@ function png(width: number, height: number, size = 300): Uint8Array {
   return bytes
 }
 
-/** Imitation de la liaison Images : dimensions lues dans l'en-tête, WebP de sortie déterministe. */
+/**
+ * Imitation de la liaison Images : dimensions lues dans l'en-tête (PNG), ou `webpSize` pour un WebP ;
+ * WebP de sortie déterministe. `converted` et `maxSides` gardent chaque conversion et son plafond.
+ */
 const converted: Uint8Array[] = []
-const fakeImages: SymbolImages = {
+const maxSides: number[] = []
+let webpSize = { width: 64, height: 64 }
+const fakeImages: SetMediaImages = {
   async info(bytes) {
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
     if (bytes[0] === 0x89) return { format: 'image/png', width: view.getUint32(16), height: view.getUint32(20) }
-    if (String.fromCharCode(...bytes.subarray(8, 12)) === 'WEBP') return { format: 'image/webp', width: 64, height: 64 }
+    if (String.fromCharCode(...bytes.subarray(8, 12)) === 'WEBP') return { format: 'image/webp', ...webpSize }
     throw new Error('pas une image')
   },
-  async toWebp(bytes) {
+  async toWebp(bytes, maxSide) {
     converted.push(bytes)
+    maxSides.push(maxSide)
     return webp(320, 9)
   },
 }
 
-function symbol(language: string, target: string, source: string): Promise<Response> {
+function setMedia(route: 'symbol' | 'logo', language: string, target: string, source: string, method = 'POST'): Promise<Response> {
   const deps = makeDeps(fake, clock)
   const query = new URLSearchParams({ language, target, source })
-  return handleAdmin(new Request(`${ORIGIN}/admin/import/symbol?${query}`, { method: 'POST', headers: { authorization: `Bearer ${TOKEN}` } }), {
+  return handleAdmin(new Request(`${ORIGIN}/admin/import/${route}?${query}`, { method, headers: { authorization: `Bearer ${TOKEN}` } }), {
     config: deps.config,
     d1: env.DB,
     bucket: env.BUCKET,
     fetcher: fake.fetcher,
     adminToken: TOKEN,
     now: clock.now,
-    symbolImages: fakeImages,
+    mediaImages: fakeImages,
   })
 }
+const symbol = (language: string, target: string, source: string) => setMedia('symbol', language, target, source)
+const logo = (language: string, target: string, source: string) => setMedia('logo', language, target, source)
 
 const respond =
   (body: BodyInit | null, status = 200, headers: Record<string, string> = { 'content-type': 'image/png' }) =>
@@ -369,6 +377,8 @@ const symbolRow = (id: string) =>
 describe('POST /admin/import/symbol', () => {
   beforeEach(() => {
     converted.length = 0
+    maxSides.length = 0
+    webpSize = { width: 64, height: 64 }
   })
 
   it('schéma (migration 0005) : symbol_provider NULL par défaut, limité à pokecardex', async () => {
@@ -384,6 +394,7 @@ describe('POST /admin/import/symbol', () => {
     expect(res.status).toBe(201)
     expect(await res.json()).toMatchObject({ status: 'stored', key: 'cards/ja/SV1a/_symbol.webp', size: 320 })
     expect(converted).toEqual([source])
+    expect(maxSides).toEqual([SYMBOL_MAX_SIDE])
     expect(await symbolRow('ja:SV1a')).toEqual({
       symbol_status: 'downloaded',
       symbol_r2_key: 'cards/ja/SV1a/_symbol.webp',
@@ -501,5 +512,135 @@ describe('POST /admin/import/symbol', () => {
     expect(await res.json()).toMatchObject({ status: 'reconciled', size: 250 })
     expect(await symbolRow('ja:SV1a')).toMatchObject({ symbol_status: 'downloaded', symbol_file_size: 250, symbol_provider: 'pokecardex', symbol_source_url: url })
     expect(fake.count((item) => item === url)).toBe(0)
+  })
+})
+
+// ——— Logos d'extension copiés par le Worker (POST /admin/import/logo) ———
+
+const logoRow = (id: string) =>
+  one(`SELECT logo_status, logo_r2_key, logo_source_url, logo_file_size, logo_provider, logo_failure_reason FROM sets WHERE id = ?1`, id)
+
+describe('POST /admin/import/logo', () => {
+  beforeEach(() => {
+    converted.length = 0
+    maxSides.length = 0
+    webpSize = { width: 64, height: 64 }
+  })
+
+  it('TCGdex, logo d’une autre langue : WebP copié tel quel, provenance TCGdex, jamais recopié', async () => {
+    const url = `${ASSETS}/en/ex/exu/logo.webp`
+    fake.addImage(url, webp(900, 5))
+    expect(await logoRow('fr:exu')).toMatchObject({ logo_status: null })
+    const res = await logo('fr', 'exu', url)
+    expect(res.status).toBe(201)
+    expect(await res.json()).toMatchObject({ status: 'stored', key: 'cards/fr/exu/_logo.webp', size: 900, sha256: await sha256Hex(webp(900, 5)) })
+    expect(converted).toEqual([])
+    expect(await logoRow('fr:exu')).toEqual({
+      logo_status: 'downloaded',
+      logo_r2_key: 'cards/fr/exu/_logo.webp',
+      logo_source_url: url,
+      logo_file_size: 900,
+      logo_provider: null,
+      logo_failure_reason: null,
+    })
+    const object = await env.BUCKET.head('cards/fr/exu/_logo.webp')
+    expect(object?.httpMetadata?.contentType).toBe('image/webp')
+    expect(object?.customMetadata).toMatchObject({ variant: 'logo', language: 'fr', setId: 'exu', sourceUrl: url, sha256: await sha256Hex(webp(900, 5)) })
+    expect(object?.customMetadata?.source).toBeUndefined()
+    // Le symbole n'est pas touché.
+    expect(await symbolRow('fr:exu')).toMatchObject({ symbol_status: null, symbol_r2_key: null })
+
+    expect(await logo('fr', 'exu', url).then((r) => r.json())).toMatchObject({ status: 'unchanged' })
+    expect(fake.count((item) => item === url)).toBe(1)
+  })
+
+  it('PNG converti en WebP (plafond des logos), puis la synchronisation ne le remplace jamais', async () => {
+    // swsh3 a un logo dans l'API, introuvable sur le CDN : copie depuis le logo anglais.
+    const deps = makeDeps(fake, clock)
+    expect(await logoRow('fr:swsh3')).toMatchObject({ logo_status: 'not_found_on_cdn' })
+    const url = `${ASSETS}/en/swsh/swsh3/logo.png`
+    const source = png(700, 300)
+    fake.addImage(url, source, { headers: { 'content-type': 'image/png' } })
+    const res = await logo('fr', 'swsh3', url)
+    expect(res.status).toBe(201)
+    expect(converted).toEqual([source])
+    expect(maxSides).toEqual([LOGO_MAX_SIDE])
+    expect(await logoRow('fr:swsh3')).toMatchObject({ logo_status: 'downloaded', logo_source_url: url, logo_file_size: 320, logo_provider: null })
+
+    const frRequests = fake.count((item) => item === `${ASSETS}/fr/swsh/swsh3/logo.webp`)
+    clock.advance(31 * 86_400_000)
+    await startSync(new Db(env.DB), deps.config, clock.now(), { languages: ['fr'], scope: {} })
+    await drain(deps, clock)
+    expect(await logoRow('fr:swsh3')).toMatchObject({ logo_status: 'downloaded', logo_source_url: url, logo_file_size: 320 })
+    expect(fake.count((item) => item === `${ASSETS}/fr/swsh/swsh3/logo.webp`)).toBe(frRequests)
+  })
+
+  it('WebP plus grand que le plafond : réduit ; image minuscule : refusée', async () => {
+    const big = `${ASSETS}/en/ex/exu/logo.webp`
+    fake.addImage(big, webp(900, 6))
+    webpSize = { width: LOGO_MAX_SIDE + 1, height: 400 }
+    expect((await logo('fr', 'exu', big)).status).toBe(201)
+    expect(maxSides).toEqual([LOGO_MAX_SIDE])
+    expect(await logoRow('fr:exu')).toMatchObject({ logo_file_size: 320 })
+
+    const tiny = `${ASSETS}/en/sv/SV1a/logo.webp`
+    fake.addImage(tiny, webp(400, 2))
+    webpSize = { width: 7, height: 40 }
+    const res = await logo('ja', 'SV1a', tiny)
+    expect(res.status).toBe(422)
+    expect(await logoRow('ja:SV1a')).toMatchObject({ logo_status: null, logo_r2_key: null })
+  })
+
+  it('logo déjà présent : rien n’est demandé à la source', async () => {
+    await env.DB.prepare(`UPDATE sets SET logo_status = 'downloaded', logo_r2_key = 'cards/fr/exu/_logo.webp' WHERE id = 'fr:exu'`).run()
+    const url = `${ASSETS}/en/ex/exu/logo.webp`
+    const before = fake.requests.length
+    expect(await logo('fr', 'exu', url).then((r) => r.json())).toMatchObject({ status: 'unchanged', key: 'cards/fr/exu/_logo.webp' })
+    expect(fake.requests.length).toBe(before)
+  })
+
+  it('refuse tout autre hôte ou chemin, et les adresses de symbole, sans aucune requête', async () => {
+    const before = fake.requests.length
+    for (const source of [
+      `${PCX}/logos/BS.png`,
+      `${PCX}/symboles/BS.png`,
+      `${ASSETS}/univ/swsh/swsh3/symbol.png`,
+      `${ASSETS}/univ/swsh/swsh3/logo.png`,
+      `${ASSETS}/en/swsh/swsh3/logo.jpg`,
+      `${ASSETS}/en/swsh/swsh3/logo`,
+      `${ASSETS}/en/swsh/swsh3/logo.webp?x=1`,
+      `${ASSETS}/en/swsh/../swsh3/logo.webp`,
+      `${ASSETS}/english/swsh/swsh3/logo.webp`,
+      'http://assets.tcgdex.net/en/swsh/swsh3/logo.webp',
+      'https://images.pokemontcg.io/swsh3/logo.png',
+      '',
+    ]) {
+      expect((await logo('fr', 'exu', source)).status, source).toBe(400)
+    }
+    // Une adresse de logo n'est pas un symbole.
+    expect((await symbol('fr', 'exu', `${ASSETS}/en/ex/exu/logo.webp`)).status).toBe(400)
+    expect(fake.requests.length).toBe(before)
+    expect(await logoRow('fr:exu')).toMatchObject({ logo_status: null, logo_r2_key: null })
+  })
+
+  it('source absente ou en panne : D1 et R2 inchangés ; objet R2 étranger jamais écrasé', async () => {
+    const url = `${ASSETS}/en/ex/exu/logo.webp`
+    expect((await logo('fr', 'exu', url)).status).toBe(424)
+    fake.queue(url, respond('panne', 503, { 'content-type': 'text/plain' }))
+    expect((await logo('fr', 'exu', url)).status).toBe(502)
+    fake.queue(url, respond(webp(300, 1), 200, { 'content-type': 'image/webp', etag: '"00000000000000000000000000000000"' }))
+    expect(await logo('fr', 'exu', url).then((r) => r.json())).toMatchObject({ status: 'source_error' })
+    expect(await logoRow('fr:exu')).toMatchObject({ logo_status: null, logo_r2_key: null })
+    expect((await env.BUCKET.list({ prefix: 'cards/fr/exu/_logo' })).objects).toEqual([])
+
+    await env.BUCKET.put('cards/fr/exu/_logo.webp', webp(200, 3), { customMetadata: { setId: 'autre', sha256: 'x' } })
+    fake.addImage(url, webp(900, 5))
+    expect((await logo('fr', 'exu', url)).status).toBe(409)
+    expect((await env.BUCKET.head('cards/fr/exu/_logo.webp'))?.size).toBe(200)
+  })
+
+  it('méthode autre que POST : 405', async () => {
+    expect((await setMedia('logo', 'fr', 'exu', `${ASSETS}/en/ex/exu/logo.webp`, 'GET')).status).toBe(405)
+    expect((await setMedia('symbol', 'fr', 'exu', `${ASSETS}/univ/ex/exu/symbol.webp`, 'GET')).status).toBe(405)
   })
 })

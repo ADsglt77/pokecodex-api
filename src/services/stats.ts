@@ -277,8 +277,9 @@ export function formatStatus(stats: Stats): string {
       `${pad('Erreurs')}: ${n(lang.errors)}`,
       `${pad('En attente')}: ${n(lang.imagesPending)}`,
       `${pad('Petites images (low)')}: ${n(lang.lowImagesStored)} / ${n(lang.imagesStored)} (introuvables ${n(lang.lowImagesMissing)}, erreurs ${n(lang.lowImagesErrors)}, à faire ${n(lang.lowImagesPending)})`,
-      // Logos copiés de TCGdex / extensions dont TCGdex donne un logo ; les ajouts sont comptés à part.
-      `${pad('Logos d’extension')}: ${n(lang.logosStored - lang.manualLogos)} / ${n(lang.setsWithLogo)} (introuvables ${n(lang.logosMissing)}, erreurs ${n(lang.logosErrors)}, à faire ${n(lang.logosPending)})`,
+      // Logos copiés (toutes sources : tâche TCGdex, `POST /admin/import/image` et `/admin/import/logo`) /
+      // toutes les extensions, comme les symboles ; les ajouts Pokécardex sont aussi comptés à part.
+      `${pad('Logos d’extension')}: ${n(lang.logosStored)} / ${n(lang.setsTotal)} (introuvables ${n(lang.logosMissing)}, erreurs ${n(lang.logosErrors)}, à faire ${n(lang.logosPending)})`,
       // Symboles copiés (toutes sources : tâche TCGdex et `POST /admin/import/symbol`) / toutes les extensions.
       `${pad('Symboles d’extension')}: ${n(lang.symbolsStored)} / ${n(lang.setsTotal)} (introuvables ${n(lang.symbolsMissing)}, erreurs ${n(lang.symbolsErrors)}, à faire ${n(lang.symbolsPending)})`,
       ...(lang.manualCards || lang.manualSets || lang.manualImages || lang.manualLogos || lang.manualSymbols

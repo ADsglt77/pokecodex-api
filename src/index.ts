@@ -12,7 +12,7 @@ import { handleAdmin, json } from './admin/router'
 import { parseConfig, type Config, type ConfigSource } from './config'
 import { Db } from './db'
 import { runTick } from './services/runner'
-import { imagesBindingAdapter } from './services/symbols'
+import { imagesBindingAdapter } from './services/set-media-import'
 import { startSync } from './services/sync'
 import { log, logError } from './utils/log'
 
@@ -36,7 +36,7 @@ export default {
         fetcher: (input, init) => fetch(input, init),
         adminToken: env.ADMIN_TOKEN,
         waitUntil: (promise) => ctx.waitUntil(promise),
-        symbolImages: imagesBindingAdapter(env.IMAGES, config.maxImageBytes),
+        mediaImages: imagesBindingAdapter(env.IMAGES, config.maxImageBytes),
       })
     }
     return json({ error: 'route inconnue' }, 404)

@@ -22,6 +22,8 @@
  *                                      ?kind=main|low|logo&language=fr|ja&target=<id>&source=<adresse d'origine>)
  *   POST /admin/import/symbol          copie le symbole d'une extension, que le Worker télécharge lui-même
  *                                      (?language=fr|ja&target=<id>&source=<adresse TCGdex ou Pokécardex>)
+ *   POST /admin/import/logo            copie le logo d'une extension, que le Worker télécharge lui-même
+ *                                      (?language=fr|ja&target=<id>&source=<adresse TCGdex>)
  */
 
 import { IMAGES_PREFIX, isLanguage, REPORTS_PREFIX, type Config, type Language } from '../config'
@@ -30,7 +32,7 @@ import { ERROR_IMAGE_STATUSES, MISSING_IMAGE_STATUSES } from '../repositories/ca
 import { enqueueStmts } from '../repositories/jobs'
 import { importCatalog, InputError, MAX_CATALOG_BYTES, storeImage, type ImageKind } from '../services/manual-import'
 import { failedJobs, problemCards, setCoverage } from '../services/reports'
-import { storeSymbol, type SymbolImages } from '../services/symbols'
+import { storeSetMedia, type SetMediaImages } from '../services/set-media-import'
 import { runTick } from '../services/runner'
 import { collectStats, formatStatus } from '../services/stats'
 import { backfillMedia, cancelSync, pauseSync, resumeSync, retryMissing, startSync } from '../services/sync'
@@ -50,8 +52,8 @@ export interface AdminDeps {
   now?: () => number
   /** Prolonge le travail après une déconnexion du client (`ctx.waitUntil`, 30 s au plus). */
   waitUntil?: (promise: Promise<unknown>) => void
-  /** Dimensions et conversion en WebP des symboles copiés (liaison Cloudflare Images). */
-  symbolImages?: SymbolImages
+  /** Dimensions et conversion en WebP des logos et symboles copiés (liaison Cloudflare Images). */
+  mediaImages?: SetMediaImages
 }
 
 /**
@@ -86,6 +88,8 @@ const POST_ROUTES = [
   '/admin/selftest',
   '/admin/import/catalog',
   '/admin/import/image',
+  '/admin/import/symbol',
+  '/admin/import/logo',
 ]
 
 /** Langues demandées (`?language=fr,ja`), toutes par défaut ; `null` si une valeur est inconnue. */
@@ -267,14 +271,15 @@ export async function handleAdmin(request: Request, deps: AdminDeps): Promise<Re
         const status = { stored: 201, reconciled: 200, unchanged: 200, conflict: 409, not_found: 404, invalid: 422 }[outcome.status]
         return json(outcome, status)
       }
-      if (path === '/admin/import/symbol') {
+      if (path === '/admin/import/symbol' || path === '/admin/import/logo') {
+        const kind = path === '/admin/import/logo' ? 'logo' : 'symbol'
         const language = url.searchParams.get('language')
         const target = url.searchParams.get('target') ?? ''
         if (!isLanguage(language)) return json({ error: 'langue inconnue (fr ou ja)' }, 400)
         if (!target || target.length > 80) return json({ error: 'target manquant' }, 400)
-        if (!deps.symbolImages) return json({ error: 'liaison Images absente : conversion impossible' }, 500)
-        const request = { language, target, sourceUrl: url.searchParams.get('source') ?? '' }
-        const outcome = await storeSymbol(db, deps.bucket, config, deps.fetcher, deps.symbolImages, request, now)
+        if (!deps.mediaImages) return json({ error: 'liaison Images absente : conversion impossible' }, 500)
+        const request = { kind, language, target, sourceUrl: url.searchParams.get('source') ?? '' } as const
+        const outcome = await storeSetMedia(db, deps.bucket, config, deps.fetcher, deps.mediaImages, request, now)
         // 424 : la source n'a pas le fichier (définitif) ; 502 : panne passagère de la source (à retenter).
         const status = { stored: 201, reconciled: 200, unchanged: 200, conflict: 409, not_found: 404, invalid: 422, source_not_found: 424, source_refused: 424, source_error: 502 }[outcome.status]
         return json(outcome, status)

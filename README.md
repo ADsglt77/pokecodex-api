@@ -194,10 +194,11 @@ longueur annoncée, **MD5 = ETag** du CDN), puis écrite dans R2 avec le contrô
 d'extension en `application/octet-stream` (sondé le 14/11/2026), accepté pour eux seuls ; la
 signature, les tailles et le MD5 restent exigés. D1
 n'est mis à jour qu'une fois l'écriture confirmée. Aucun téléchargement corrompu ne peut donc écraser
-un objet. Les images ne sont ni recompressées ni modifiées, sauf les symboles copiés par
-`POST /admin/import/symbol` reçus en PNG (ou de plus de 512 px), que la liaison Images convertit en
-WebP : pour eux, `symbol_sha256` est l'empreinte du WebP stocké, celle du fichier d'origine est dans la
-métadonnée R2 `sourceSha256`. Le bucket reste **privé** : aucun domaine
+un objet. Les images ne sont ni recompressées ni modifiées, sauf les logos et symboles copiés par
+`POST /admin/import/logo` et `/admin/import/symbol` reçus en PNG (ou de plus de 2 048 px pour un logo,
+512 px pour un symbole), que la liaison Images convertit en WebP sans perte : pour eux, `logo_sha256` /
+`symbol_sha256` est l'empreinte du WebP stocké, celle du fichier d'origine est dans la métadonnée R2
+`sourceSha256`. Le bucket reste **privé** : aucun domaine
 public n'est configuré (les images sont des œuvres protégées).
 
 ## Images manquantes
@@ -338,6 +339,7 @@ Ou avec curl : `curl -s -H "Authorization: Bearer $(cat .secrets/admin-token.txt
 | `POST /admin/import/catalog` | ajoute séries, extensions et cartes d'une autre source (corps JSON, voir « Ajouts hors TCGdex ») ; ne modifie jamais une ligne existante |
 | `POST /admin/import/image` | envoie l'image d'une carte ou le logo d'une extension (corps WebP ; `?kind=main\|low\|logo&language=&target=&source=`) ; n'écrase jamais rien |
 | `POST /admin/import/symbol` | copie le symbole d'une extension qui n'en a pas : le Worker télécharge lui-même `source` (TCGdex `univ/…/symbol.png\|webp` ou Pokécardex `symboles[_jp]/<code>.png`), le convertit en WebP (liaison Images) ; `?language=&target=&source=` ; 424 si la source n'a pas le fichier, 502 si elle est en panne |
+| `POST /admin/import/logo` | copie le logo d'une extension qui n'en a pas, de la même façon : `source` = logo TCGdex d'une autre langue (`<langue>/<série>/<ext>/logo.webp\|png`) ou PNG de Poképédia, 52poke ou Bulbagarden (fichiers MediaWiki) ; mêmes paramètres et codes de retour |
 
 ## Ajouts hors TCGdex (copie Pokécardex)
 
@@ -365,7 +367,7 @@ d'écarter Pokécardex). Rien n'est téléchargé : tout part de la copie locale
   comme pour TCGdex ; métadonnées R2 `source: pokecardex`, `sourceUrl`, `sha256` et l'identité
   attendue par les tâches (`tcgdexId`, `setId`) ; écriture conditionnelle (`onlyIf`) : un objet déjà
   présent n'est jamais remplacé (même contenu : réconcilié).
-- **Symboles d'extension** (`src/services/symbols.ts`, migration `0005_set_symbol_provider.sql` :
+- **Symboles d'extension** (`src/services/set-media-import.ts`, migration `0005_set_symbol_provider.sql` :
   `sets.symbol_provider`, NULL = TCGdex, `'pokecardex'`) : seule exception au « rien n'est
   téléchargé », autorisée par l'utilisateur le 24/11/2026 (la copie du 28/10 ne contient aucun
   symbole). `POST /admin/import/symbol` fait télécharger le fichier par le Worker lui-même, sur deux
@@ -378,10 +380,16 @@ d'écarter Pokécardex). Rien n'est téléchargé : tout part de la copie locale
   `sourceUrl`, `sourceSha256`). Une extension qui a déjà un symbole n'est jamais touchée (aucune
   requête) ; un échec de la source ne modifie pas D1 ; la tâche `symbol` de la synchronisation ne
   remplace jamais un symbole copié.
+- **Logos d'une autre langue** (même module, 25/11/2026) : `POST /admin/import/logo` copie de la même
+  façon le logo d'une extension qui n'en a pas, pour les extensions dont l'API ne donne aucun logo
+  dans leur langue (TCG Pocket en français : logo anglais). Seul hôte : `assets.tcgdex.net`, chemin
+  `/<langue>/<série>/<ext>/logo.webp|png` (MD5 = ETag) ; `logo_provider` NULL ; un PNG ou un logo de
+  plus de 2 048 px est converti en WebP sans perte ; écrit à `cards/<l>/<ext>/_logo.webp`.
 - **Scripts** : `scripts/pokecardex/prepare.mjs` construit les lots depuis la copie locale et les
   fichiers d'analyse (dans `.local/pokecardex/`, ignoré par Git) ; `scripts/import-manual.mjs`
-  (`catalog`, `logos`, `images`) les envoie, avec journal de reprise ; `symbols <plan.json>` demande
-  au Worker chaque symbole, une adresse à la fois (3 s d'écart chez Pokécardex, 0,3 s chez TCGdex).
+  (`catalog`, `logos`, `images`) les envoie, avec journal de reprise ; `symbols <plan.json>` et
+  `logo-urls <plan.json>` demandent au Worker chaque symbole ou logo, une adresse à la fois (3 s
+  d'écart chez Pokécardex, 0,3 s chez TCGdex).
 - **Filigranes** : les scans de Pokécardex portent souvent un filigrane intégré (« POKÉCARDEX » en
   bande à mi-hauteur, en diagonale, ou « pokecardex.com ») ; les rendus numériques officiels sont
   propres, mais dans beaucoup d'extensions japonaises les cartes secrètes (UR dorées) sont des scans

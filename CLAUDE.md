@@ -18,9 +18,10 @@ sur un Worker Cloudflare indépendant (`pokecodex-importer`). Tout le fonctionne
 - Ajouts hors TCGdex (copie Pokécardex du 28/10, autorisée par l'utilisateur le 23/11/2026) :
   uniquement par `POST /admin/import/*`, qui n'écrase jamais rien. **Aucune image filigranée** :
   chaque image est vérifiée carte par carte avant envoi ; en cas de doute, demander à l'utilisateur
-  (il a signalé des faux positifs). Aucun nom de source dans les ids ni les clés. Seule exception
+  (il a signalé des faux positifs). Aucun nom de source dans les ids ni les clés. Seules exceptions
   au « rien n'est téléchargé » : les symboles d'extension (`POST /admin/import/symbol`, autorisé le
-  24/11/2026), que le Worker télécharge lui-même chez TCGdex ou Pokécardex (`src/services/symbols.ts`).
+  24/11/2026), que le Worker télécharge lui-même chez TCGdex ou Pokécardex, et les logos d'une autre
+  langue chez TCGdex (`POST /admin/import/logo`, 25/11/2026) ; code : `src/services/set-media-import.ts`.
 
 ## Environnement
 
@@ -60,10 +61,14 @@ convertirait `/admin/…` en chemin Windows).
   verrou de tâche ≥ verrou de l'exécuteur ; le verrou de l'exécuteur est renouvelé dans le batch de
   chaque lot. Une tâche rendue (429, dépendance) l'est `MAX_RELEASES` fois au plus.
 - **Réseau** : aucune redirection suivie (`redirect: 'manual'`), seuls `api.tcgdex.net` et
-  `assets.tcgdex.net` en https ; une URL d'image officielle d'une autre langue est ignorée. Exception
-  unique : `POST /admin/import/symbol` contacte aussi `pokecardex.b-cdn.net`, au chemin exact
-  `/assets/images/symboles[_jp]/<code>.png` (`SYMBOL_SOURCES`), une adresse par appel.
-- **Liaison Images** (`IMAGES`) : seulement pour convertir en WebP les symboles reçus en PNG ;
+  `assets.tcgdex.net` en https ; une URL d'image officielle d'une autre langue est ignorée par la
+  synchronisation. Exceptions, une adresse par appel et au chemin exact (`SET_MEDIA_SOURCES`) :
+  `POST /admin/import/symbol` contacte aussi `pokecardex.b-cdn.net`
+  (`/assets/images/symboles[_jp]/<code>.png`), et `POST /admin/import/logo` accepte un logo TCGdex
+  d'une autre langue (`/<langue>/<série>/<ext>/logo.webp|png`) ou un PNG de Poképédia, 52poke ou
+  Bulbagarden (autorisés le 25/11/2026). Ajouter un hôte = accord de l'utilisateur d'abord.
+- **Liaison Images** (`IMAGES`) : seulement pour convertir en WebP les logos et symboles reçus en PNG
+  (ou trop grands : 512 px pour un symbole, 2 048 px pour un logo) ;
   facturée par transformation unique (5 000 incluses par mois). Après tout changement de
   `wrangler.jsonc`, `npx wrangler types`.
 - **TCGdex** (sondé le 13/11/2026) : pas de limite publiée mais « be considerate » (≤ 4 requêtes/s) ;
@@ -103,7 +108,7 @@ convertirait `/admin/…` en chemin Windows).
 (petites images, logos et symboles), `src/services/catalog.ts` (catalogue, extensions, index),
 `src/services/cards.ts` (détails), `src/services/reports.ts` (audit et exports),
 `src/repositories/jobs.ts` (file de tâches), `src/services/manual-import.ts` (ajouts hors TCGdex),
-`src/services/symbols.ts` (symboles copiés par l'API d'import),
+`src/services/set-media-import.ts` (logos et symboles copiés par l'API d'import),
 `migrations/` (schéma : `0001_initial.sql`, `0002_media.sql`, `0003_set_symbols.sql`,
 `0004_manual_sources.sql`, `0005_set_symbol_provider.sql`), `tests/helpers.ts` (faux TCGdex, horloge
 simulée), `tests/media.test.ts`,
