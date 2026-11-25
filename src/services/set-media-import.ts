@@ -22,7 +22,7 @@ import { BodyTooLargeError, fetchClassified, readCapped } from '../utils/http'
 import { internalId, setLogoKey, setSymbolKey } from '../utils/keys'
 import { errorMessage } from '../utils/log'
 import { iso } from '../utils/time'
-import { InputError, MANUAL_SOURCE, type ImageOutcome } from './manual-import'
+import { InputError, MANUAL_SOURCE, storeImage, type ImageOutcome } from './manual-import'
 
 /** Hôte d'où un logo ou un symbole peut être copié, avec le chemin exact accepté. */
 interface MediaSource {
@@ -106,8 +106,8 @@ export const MEDIA_MIN_SIDE = 8
 /** Dimensions et conversion d'image : la liaison Cloudflare Images en production, une imitation en test. */
 export interface SetMediaImages {
   info(bytes: Uint8Array): Promise<{ format: string; width: number; height: number }>
-  /** Le même dessin en WebP sans perte, à sa taille d'origine plafonnée à `maxSide`. */
-  toWebp(bytes: Uint8Array, maxSide: number): Promise<Uint8Array>
+  /** Le même dessin en WebP, à sa taille d'origine plafonnée à `maxSide` (sans perte par défaut). */
+  toWebp(bytes: Uint8Array, maxSide: number, quality?: number): Promise<Uint8Array>
 }
 
 /** Adaptateur de la liaison Cloudflare Images (`env.IMAGES`) : rien n'est stocké chez Images. */
@@ -119,11 +119,11 @@ export function imagesBindingAdapter(images: ImagesBinding, maxBytes: number): S
       if (!('width' in info)) throw new Error(`format non pris en charge : ${info.format}`)
       return { format: info.format, width: info.width, height: info.height }
     },
-    async toWebp(bytes, maxSide) {
+    async toWebp(bytes, maxSide, quality = 100) {
       const result = await images
         .input(stream(bytes))
         .transform({ width: maxSide, height: maxSide, fit: 'scale-down' })
-        .output({ format: 'image/webp', quality: 100 })
+        .output({ format: 'image/webp', quality })
       return readCapped(result.response(), maxBytes)
     },
   }
@@ -178,6 +178,159 @@ const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
 const isPng = (bytes: Uint8Array): boolean => bytes.byteLength > 8 && PNG_SIGNATURE.every((byte, i) => bytes[i] === byte)
 const isWebp = (bytes: Uint8Array): boolean =>
   bytes.byteLength >= 12 && String.fromCharCode(...bytes.subarray(0, 4)) === 'RIFF' && String.fromCharCode(...bytes.subarray(8, 12)) === 'WEBP'
+
+/**
+ * Télécharge le fichier d'une source acceptée et contrôle le transfert (type MIME, taille, longueur
+ * annoncée, MD5 = ETag si l'hôte le garantit) ; rend les octets, ou l'issue à renvoyer telle quelle.
+ */
+async function downloadSource(
+  db: Db,
+  fetcher: typeof fetch,
+  source: MediaSource,
+  sourceUrl: string,
+  config: Pick<Config, 'minImageBytes' | 'maxImageBytes' | 'fetchTimeoutMs'>,
+  now: () => number,
+): Promise<{ bytes: Uint8Array } | SetMediaOutcome> {
+  db.usage.httpRequests++
+  const outcome = await fetchClassified(
+    fetcher,
+    sourceUrl,
+    { method: 'GET', headers: { accept: source.accept, 'user-agent': MEDIA_USER_AGENT }, cache: 'no-store', redirect: 'manual' },
+    config.fetchTimeoutMs,
+    now,
+  )
+  if (outcome.kind === 'not_found') return { status: 'source_not_found', reason: `HTTP ${outcome.status} à ${sourceUrl}`, httpStatus: outcome.status }
+  if (outcome.kind === 'client_error') return { status: 'source_refused', reason: `HTTP ${outcome.status} à ${sourceUrl}`, httpStatus: outcome.status }
+  if (outcome.kind !== 'ok') {
+    const reason = outcome.kind === 'network_error' ? outcome.message : `HTTP ${outcome.status} à ${sourceUrl}`
+    return { status: 'source_error', reason, httpStatus: outcome.status }
+  }
+  const { response } = outcome
+  const type = (response.headers.get('content-type') ?? '').split(';')[0]?.trim().toLowerCase() ?? ''
+  if (!source.types.includes(type)) {
+    await response.body?.cancel()
+    return { status: 'invalid', reason: `type MIME inattendu : ${type || 'absent'}` }
+  }
+  let bytes: Uint8Array
+  try {
+    bytes = await readCapped(response, config.maxImageBytes)
+  } catch (error) {
+    if (error instanceof BodyTooLargeError) return { status: 'invalid', reason: `fichier trop volumineux (${config.maxImageBytes} octets au plus)` }
+    return { status: 'source_error', reason: `lecture interrompue : ${errorMessage(error)}`, httpStatus: outcome.status }
+  }
+
+  // Intégrité du transfert : longueur annoncée et, chez TCGdex, MD5 = ETag.
+  const declared = response.headers.get('content-length')
+  const encoded = !['', 'identity'].includes((response.headers.get('content-encoding') ?? '').trim().toLowerCase())
+  if (!encoded && declared !== null && /^\d+$/.test(declared) && Number(declared) !== bytes.byteLength) {
+    return { status: 'source_error', reason: `longueur reçue ${bytes.byteLength} ≠ annoncée ${declared}`, httpStatus: outcome.status }
+  }
+  if (source.md5Etag) {
+    const etag = (response.headers.get('etag') ?? '').replace(/^W\//, '').replaceAll('"', '').toLowerCase()
+    const md5 = toHex(await crypto.subtle.digest('MD5', bytes))
+    if (/^[0-9a-f]{32}$/.test(etag) && etag !== md5) return { status: 'source_error', reason: `MD5 ${md5} ≠ ETag ${etag}`, httpStatus: outcome.status }
+  }
+  if (bytes.byteLength < config.minImageBytes) return { status: 'invalid', reason: `fichier trop petit (${bytes.byteLength} octets)` }
+  return { bytes }
+}
+
+// ——— Images de cartes copiées par le Worker (POST /admin/import/card) ———
+
+/** Sources des images de cartes (autorisées par l'utilisateur le 25/11/2026) ; une adresse par appel. */
+export const CARD_SOURCES: readonly MediaSource[] = [
+  {
+    host: 'www.pokepedia.fr',
+    path: /^\/images\/[0-9a-f]\/[0-9a-f]{2}\/[A-Za-z0-9._%()'!,&+-]{1,300}\.(?:png|jpe?g)$/i,
+    provider: MANUAL_SOURCE,
+    accept: 'image/png, image/jpeg',
+    types: ['image/png', 'image/jpeg'],
+    md5Etag: false,
+  },
+  {
+    host: 'assets.pokemon.com',
+    path: /^\/assets\/[A-Za-z0-9._\/-]{1,200}\.png$/,
+    provider: MANUAL_SOURCE,
+    accept: 'image/png',
+    types: ['image/png'],
+    md5Etag: false,
+  },
+]
+/** Image principale : côté long plafonné, WebP avec perte (comme les images de TCGdex). */
+const CARD_MAIN = { maxSide: 1024, quality: 90 }
+/** Petite image (grilles) : 342 px de haut pour une carte standard (245×342). */
+const CARD_LOW = { maxSide: 342, quality: 85 }
+/** En dessous, ce n'est pas un scan de carte exploitable. */
+const CARD_MIN_SIDE = 100
+
+const isJpeg = (bytes: Uint8Array): boolean => bytes.byteLength > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff
+
+export interface CardImageRequest {
+  language: Language
+  /** Id TCGdex de la carte. */
+  target: string
+  sourceUrl: string
+}
+
+/**
+ * Copie l'image d'une carte qui n'en a aucune : télécharge `sourceUrl` (hôte de `CARD_SOURCES`),
+ * la convertit en WebP (image principale et petite image) avec la liaison Images, puis l'écrit par
+ * `storeImage` (mêmes règles que `POST /admin/import/image` : jamais d'écrasement). Carte qui a déjà
+ * une image valide → `unchanged`, sans aucune requête.
+ */
+export async function storeCardFromUrl(
+  db: Db,
+  bucket: R2Bucket,
+  config: Pick<Config, 'minImageBytes' | 'maxImageBytes' | 'fetchTimeoutMs'>,
+  fetcher: typeof fetch,
+  images: SetMediaImages,
+  request: CardImageRequest,
+  now: () => number,
+): Promise<SetMediaOutcome & { low?: string }> {
+  const source = pickSource(CARD_SOURCES, request.sourceUrl, 'une image de carte')
+  const card = await db.first<{ image_status: string; image_r2_key: string | null }>(
+    `SELECT image_status, image_r2_key FROM cards WHERE id = ?1`,
+    internalId(request.language, request.target),
+  )
+  if (!card) return { status: 'not_found', reason: `carte ${request.language}/${request.target} inconnue` }
+  if (['downloaded', 'recovered_from_cdn', 'already_present'].includes(card.image_status) && card.image_r2_key) {
+    return { status: 'unchanged', key: card.image_r2_key, reason: 'image déjà présente' }
+  }
+  const download = await downloadSource(db, fetcher, source, request.sourceUrl, config, now)
+  if ('status' in download) return download
+  const { bytes } = download
+  if (!isPng(bytes) && !isJpeg(bytes) && !isWebp(bytes)) return { status: 'invalid', reason: 'ni PNG, ni JPEG, ni WebP (signature absente)' }
+  let size: { width: number; height: number }
+  try {
+    size = await images.info(bytes)
+  } catch (error) {
+    if (!isFileImageError(error)) throw error
+    return { status: 'invalid', reason: `image illisible : ${errorMessage(error)}` }
+  }
+  if (size.width < CARD_MIN_SIDE || size.height < CARD_MIN_SIDE) return { status: 'invalid', reason: `image trop petite (${size.width}×${size.height})` }
+
+  const main = await images.toWebp(bytes, CARD_MAIN.maxSide, CARD_MAIN.quality)
+  const stored = await storeImage(db, bucket, config, { kind: 'main', language: request.language, target: request.target, sourceUrl: request.sourceUrl, bytes: main }, now())
+  if (!['stored', 'reconciled', 'unchanged'].includes(stored.status)) return stored
+  const low = await images.toWebp(bytes, CARD_LOW.maxSide, CARD_LOW.quality)
+  const lowStored = await storeImage(db, bucket, config, { kind: 'low', language: request.language, target: request.target, sourceUrl: request.sourceUrl, bytes: low }, now())
+  return { ...stored, low: lowStored.status }
+}
+
+/** Source d'une adresse parmi `sources` ; `InputError` (400) si l'adresse n'est pas exactement au format attendu. */
+function pickSource(sources: readonly MediaSource[], sourceUrl: string, label: string): MediaSource {
+  let url: URL | null = null
+  try {
+    url = new URL(sourceUrl)
+  } catch {
+    // adresse illisible : refusée ci-dessous
+  }
+  const source = sources.find((item) => item.host === url?.host)
+  const exact = url !== null && url.href === sourceUrl && !sourceUrl.includes('?') && !sourceUrl.includes('#')
+  if (!url || !source || !exact || url.protocol !== 'https:' || url.username || url.password || url.port || !source.path.test(url.pathname)) {
+    throw new InputError(`source refusée : adresse https sur ${sources.map((item) => item.host).join(' ou ')}, au format attendu pour ${label}`)
+  }
+  return source
+}
 
 interface SetMediaRow {
   id: string
@@ -239,46 +392,9 @@ export async function storeSetMedia(
     return res[0]?.meta.changes ? { status: 'reconciled', key, size: existing.size, sha256: meta.sha256 } : { status: 'unchanged', key, reason: 'déjà enregistré' }
   }
 
-  db.usage.httpRequests++
-  const outcome = await fetchClassified(
-    fetcher,
-    request.sourceUrl,
-    { method: 'GET', headers: { accept: source.accept, 'user-agent': MEDIA_USER_AGENT }, cache: 'no-store', redirect: 'manual' },
-    config.fetchTimeoutMs,
-    now,
-  )
-  if (outcome.kind === 'not_found') return { status: 'source_not_found', reason: `HTTP ${outcome.status} à ${request.sourceUrl}`, httpStatus: outcome.status }
-  if (outcome.kind === 'client_error') return { status: 'source_refused', reason: `HTTP ${outcome.status} à ${request.sourceUrl}`, httpStatus: outcome.status }
-  if (outcome.kind !== 'ok') {
-    const reason = outcome.kind === 'network_error' ? outcome.message : `HTTP ${outcome.status} à ${request.sourceUrl}`
-    return { status: 'source_error', reason, httpStatus: outcome.status }
-  }
-  const { response } = outcome
-  const type = (response.headers.get('content-type') ?? '').split(';')[0]?.trim().toLowerCase() ?? ''
-  if (!source.types.includes(type)) {
-    await response.body?.cancel()
-    return { status: 'invalid', reason: `type MIME inattendu : ${type || 'absent'}` }
-  }
-  let bytes: Uint8Array
-  try {
-    bytes = await readCapped(response, config.maxImageBytes)
-  } catch (error) {
-    if (error instanceof BodyTooLargeError) return { status: 'invalid', reason: `fichier trop volumineux (${config.maxImageBytes} octets au plus)` }
-    return { status: 'source_error', reason: `lecture interrompue : ${errorMessage(error)}`, httpStatus: outcome.status }
-  }
-
-  // Intégrité du transfert : longueur annoncée et, chez TCGdex, MD5 = ETag.
-  const declared = response.headers.get('content-length')
-  const encoded = !['', 'identity'].includes((response.headers.get('content-encoding') ?? '').trim().toLowerCase())
-  if (!encoded && declared !== null && /^\d+$/.test(declared) && Number(declared) !== bytes.byteLength) {
-    return { status: 'source_error', reason: `longueur reçue ${bytes.byteLength} ≠ annoncée ${declared}`, httpStatus: outcome.status }
-  }
-  if (source.md5Etag) {
-    const etag = (response.headers.get('etag') ?? '').replace(/^W\//, '').replaceAll('"', '').toLowerCase()
-    const md5 = toHex(await crypto.subtle.digest('MD5', bytes))
-    if (/^[0-9a-f]{32}$/.test(etag) && etag !== md5) return { status: 'source_error', reason: `MD5 ${md5} ≠ ETag ${etag}`, httpStatus: outcome.status }
-  }
-  if (bytes.byteLength < config.minImageBytes) return { status: 'invalid', reason: `fichier trop petit (${bytes.byteLength} octets)` }
+  const download = await downloadSource(db, fetcher, source, request.sourceUrl, config, now)
+  if ('status' in download) return download
+  const { bytes } = download
   const png = isPng(bytes)
   if (!png && !isWebp(bytes)) return { status: 'invalid', reason: 'ni PNG ni WebP (signature absente)' }
 

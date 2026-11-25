@@ -12,7 +12,7 @@ import { handleAdmin, json } from './admin/router'
 import { parseConfig, type Config, type ConfigSource } from './config'
 import { Db } from './db'
 import { runTick } from './services/runner'
-import { imagesBindingAdapter } from './services/set-media-import'
+import { wasmImagesAdapter } from './services/wasm-images'
 import { startSync } from './services/sync'
 import { log, logError } from './utils/log'
 
@@ -36,7 +36,8 @@ export default {
         fetcher: (input, init) => fetch(input, init),
         adminToken: env.ADMIN_TOKEN,
         waitUntil: (promise) => ctx.waitUntil(promise),
-        mediaImages: imagesBindingAdapter(env.IMAGES, config.maxImageBytes),
+        // Conversion dans le Worker (WebAssembly) : le quota gratuit de la liaison Images est épuisé.
+        mediaImages: wasmImagesAdapter(),
       })
     }
     return json({ error: 'route inconnue' }, 404)

@@ -32,7 +32,7 @@ import { ERROR_IMAGE_STATUSES, MISSING_IMAGE_STATUSES } from '../repositories/ca
 import { enqueueStmts } from '../repositories/jobs'
 import { importCatalog, InputError, MAX_CATALOG_BYTES, storeImage, type ImageKind } from '../services/manual-import'
 import { failedJobs, problemCards, setCoverage } from '../services/reports'
-import { storeSetMedia, type SetMediaImages } from '../services/set-media-import'
+import { storeCardFromUrl, storeSetMedia, type SetMediaImages } from '../services/set-media-import'
 import { runTick } from '../services/runner'
 import { collectStats, formatStatus } from '../services/stats'
 import { backfillMedia, cancelSync, pauseSync, resumeSync, retryMissing, startSync } from '../services/sync'
@@ -90,6 +90,7 @@ const POST_ROUTES = [
   '/admin/import/image',
   '/admin/import/symbol',
   '/admin/import/logo',
+  '/admin/import/card',
 ]
 
 /** Langues demandées (`?language=fr,ja`), toutes par défaut ; `null` si une valeur est inconnue. */
@@ -269,6 +270,16 @@ export async function handleAdmin(request: Request, deps: AdminDeps): Promise<Re
         if (!bytes) return json({ error: `corps WebP attendu (${config.maxImageBytes} octets au plus)` }, 413)
         const outcome = await storeImage(db, deps.bucket, config, { kind, language, target, sourceUrl: source, bytes }, now())
         const status = { stored: 201, reconciled: 200, unchanged: 200, conflict: 409, not_found: 404, invalid: 422 }[outcome.status]
+        return json(outcome, status)
+      }
+      if (path === '/admin/import/card') {
+        const language = url.searchParams.get('language')
+        const target = url.searchParams.get('target') ?? ''
+        if (!isLanguage(language)) return json({ error: 'langue inconnue (fr ou ja)' }, 400)
+        if (!target || target.length > 80) return json({ error: 'target manquant' }, 400)
+        if (!deps.mediaImages) return json({ error: 'liaison Images absente : conversion impossible' }, 500)
+        const outcome = await storeCardFromUrl(db, deps.bucket, config, deps.fetcher, deps.mediaImages, { language, target, sourceUrl: url.searchParams.get('source') ?? '' }, now)
+        const status = { stored: 201, reconciled: 200, unchanged: 200, conflict: 409, not_found: 404, invalid: 422, source_not_found: 424, source_refused: 424, source_error: 502 }[outcome.status]
         return json(outcome, status)
       }
       if (path === '/admin/import/symbol' || path === '/admin/import/logo') {

@@ -20,8 +20,10 @@ sur un Worker Cloudflare indépendant (`pokecodex-importer`). Tout le fonctionne
   chaque image est vérifiée carte par carte avant envoi ; en cas de doute, demander à l'utilisateur
   (il a signalé des faux positifs). Aucun nom de source dans les ids ni les clés. Seules exceptions
   au « rien n'est téléchargé » : les symboles d'extension (`POST /admin/import/symbol`, autorisé le
-  24/11/2026), que le Worker télécharge lui-même chez TCGdex ou Pokécardex, et les logos d'une autre
-  langue chez TCGdex (`POST /admin/import/logo`, 25/11/2026) ; code : `src/services/set-media-import.ts`.
+  24/11/2026), que le Worker télécharge lui-même chez TCGdex ou Pokécardex, les logos
+  (`POST /admin/import/logo`, 25/11/2026) et les images de cartes (`POST /admin/import/card`,
+  25/11/2026 : Poképédia et assets.pokemon.com, après vérification des planches de miniatures) ;
+  code : `src/services/set-media-import.ts`.
 
 ## Environnement
 
@@ -66,11 +68,15 @@ convertirait `/admin/…` en chemin Windows).
   `POST /admin/import/symbol` contacte aussi `pokecardex.b-cdn.net`
   (`/assets/images/symboles[_jp]/<code>.png`), et `POST /admin/import/logo` accepte un logo TCGdex
   d'une autre langue (`/<langue>/<série>/<ext>/logo.webp|png`) ou un PNG de Poképédia, 52poke ou
-  Bulbagarden (autorisés le 25/11/2026). Ajouter un hôte = accord de l'utilisateur d'abord.
-- **Liaison Images** (`IMAGES`) : seulement pour convertir en WebP les logos et symboles reçus en PNG
-  (ou trop grands : 512 px pour un symbole, 2 048 px pour un logo) ;
-  facturée par transformation unique (5 000 incluses par mois). Après tout changement de
-  `wrangler.jsonc`, `npx wrangler types`.
+  Bulbagarden (autorisés le 25/11/2026) ; `POST /admin/import/card` accepte `www.pokepedia.fr`
+  (`/images/<h>/<hh>/<fichier>.png|jpg`) et `assets.pokemon.com` (`CARD_SOURCES`). Ajouter un hôte =
+  accord de l'utilisateur d'abord.
+- **Conversion d'images** : dans le Worker lui-même, par les codecs WebAssembly jSquash
+  (`src/services/wasm-images.ts` : PNG, JPEG, WebP, redimensionnement lanczos3, `ImageData` simulé),
+  depuis que le quota gratuit de la liaison Cloudflare Images (5 000 transformations par mois) a été
+  épuisé le 25/11/2026. La liaison `IMAGES` et `imagesBindingAdapter` restent déclarées mais ne sont
+  plus utilisées. Un PNG peut faire planter le codec (`RuntimeError: unreachable`, `fr:tk-ex-latia-7`).
+  Après tout changement de `wrangler.jsonc`, `npx wrangler types`.
 - **TCGdex** (sondé le 13/11/2026) : pas de limite publiée mais « be considerate » (≤ 4 requêtes/s) ;
   encoder chaque segment d'URL (`exu-%3F` → `exu-%253F`, `SM1+` → `SM1%2B`) ; l'API renvoie parfois
   des 503 de quelques secondes ; le CDN `assets.tcgdex.net` (nginx + S3, pas Cloudflare) renvoie de
@@ -108,7 +114,8 @@ convertirait `/admin/…` en chemin Windows).
 (petites images, logos et symboles), `src/services/catalog.ts` (catalogue, extensions, index),
 `src/services/cards.ts` (détails), `src/services/reports.ts` (audit et exports),
 `src/repositories/jobs.ts` (file de tâches), `src/services/manual-import.ts` (ajouts hors TCGdex),
-`src/services/set-media-import.ts` (logos et symboles copiés par l'API d'import),
+`src/services/set-media-import.ts` (logos, symboles et images de cartes copiés par l'API d'import),
+`src/services/wasm-images.ts` (conversion WebP en WebAssembly),
 `migrations/` (schéma : `0001_initial.sql`, `0002_media.sql`, `0003_set_symbols.sql`,
 `0004_manual_sources.sql`, `0005_set_symbol_provider.sql`), `tests/helpers.ts` (faux TCGdex, horloge
 simulée), `tests/media.test.ts`,

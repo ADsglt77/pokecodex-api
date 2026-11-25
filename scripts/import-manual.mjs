@@ -139,11 +139,11 @@ if (mode === 'catalog') {
     if (++seen % 500 === 0) console.log(`${seen} / ${items.length}`, JSON.stringify(counts))
   })
   console.log(JSON.stringify(counts))
-} else if (mode === 'symbols' || mode === 'logo-urls') {
+} else if (mode === 'symbols' || mode === 'logo-urls' || mode === 'card-urls') {
   // Seules les sources acceptées par le Worker ; une adresse à la fois, au rythme de chaque hôte.
-  const route = mode === 'symbols' ? '/admin/import/symbol' : '/admin/import/logo'
-  const noun = mode === 'symbols' ? 'symboles' : 'logos'
-  const DELAY_MS = { 'pokecardex.b-cdn.net': 3_000, 'assets.tcgdex.net': 300, 'www.pokepedia.fr': 1_000, 'media.52poke.com': 1_000, 'archives.bulbagarden.net': 1_000 }
+  const route = { symbols: '/admin/import/symbol', 'logo-urls': '/admin/import/logo', 'card-urls': '/admin/import/card' }[mode]
+  const noun = { symbols: 'symboles', 'logo-urls': 'logos', 'card-urls': 'images de cartes' }[mode]
+  const DELAY_MS = { 'pokecardex.b-cdn.net': 3_000, 'assets.tcgdex.net': 300, 'www.pokepedia.fr': 700, 'assets.pokemon.com': 500, 'media.52poke.com': 1_000, 'archives.bulbagarden.net': 1_000 }
   const plan = JSON.parse(readFileSync(input, 'utf8')).extensions
   const items = plan.filter((item) => item.url && new URL(item.url).host in DELAY_MS)
   console.log(`${items.length} ${noun} à demander ; ${plan.length - items.length} entrées du plan écartées (sans adresse ou autre hôte)`)
