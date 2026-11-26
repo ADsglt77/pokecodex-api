@@ -23,7 +23,9 @@ sur un Worker Cloudflare indépendant (`pokecodex-importer`). Tout le fonctionne
   24/11/2026), que le Worker télécharge lui-même chez TCGdex ou Pokécardex, les logos
   (`POST /admin/import/logo`, 25/11/2026) et les images de cartes (`POST /admin/import/card`,
   25/11/2026 : Poképédia et assets.pokemon.com, après vérification des planches de miniatures) ;
-  code : `src/services/set-media-import.ts`.
+  code : `src/services/set-media-import.ts`. Images reconstituées (`POST /admin/import/card-overlay`,
+  26/11/2026) : image d'une carte d'origine déjà dans R2 + tampon de deck, composées dans le Worker
+  (`composeOverlay` de `wasm-images.ts`) ; `image_source_url` = `reconstitution:<l>/<origine>`.
 
 ## Environnement
 

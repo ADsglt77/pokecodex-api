@@ -181,6 +181,22 @@ if (mode === 'catalog') {
     if (!['unchanged', 'reconciled', 'conflict', 'not_found'].includes(json.status)) await sleep(DELAY_MS[new URL(item.url).host])
   }
   console.log(JSON.stringify(counts))
+} else if (mode === 'card-overlays') {
+  // Images reconstituées : { extensions: [{ id, origin, x, y, w, file }] } (calque PNG + position relative).
+  const items = JSON.parse(readFileSync(input, 'utf8')).extensions
+  const log = journal(input.replace(/\.json$/, '.journal.jsonl'))
+  const counts = {}
+  await pool(
+    items.filter((item) => !log.done.has(item.id)),
+    async (item) => {
+      const split = item.id.indexOf(':')
+      const query = new URLSearchParams({ language: item.id.slice(0, split), target: item.id.slice(split + 1), origin: item.origin, x: String(item.x), y: String(item.y), w: String(item.w) })
+      const { status, json } = await post(`/admin/import/card-overlay?${query}`, readFileSync(item.file), 'image/png')
+      log.write({ id: item.id, status, result: json.status ?? null, reason: json.reason ?? json.error ?? null, key: json.key ?? null, final: FINAL.has(json.status) })
+      counts[json.status ?? `http_${status}`] = (counts[json.status ?? `http_${status}`] ?? 0) + 1
+    },
+  )
+  console.log(JSON.stringify(counts))
 } else {
-  throw new Error('mode : catalog, logos, images, symbols ou logo-urls')
+  throw new Error('mode : catalog, logos, images, symbols, logo-urls, card-urls ou card-overlays')
 }

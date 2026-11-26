@@ -23,6 +23,7 @@ import { internalId, setLogoKey, setSymbolKey } from '../utils/keys'
 import { errorMessage } from '../utils/log'
 import { iso } from '../utils/time'
 import { InputError, MANUAL_SOURCE, storeImage, type ImageOutcome } from './manual-import'
+import { composeOverlay, type OverlayPlace } from './wasm-images'
 
 /** Hôte d'où un logo ou un symbole peut être copié, avec le chemin exact accepté. */
 interface MediaSource {
@@ -315,6 +316,56 @@ export async function storeCardFromUrl(
   const lowStored = await storeImage(db, bucket, config, { kind: 'low', language: request.language, target: request.target, sourceUrl: request.sourceUrl, bytes: low }, now())
   return { ...stored, low: lowStored.status }
 }
+
+// ——— Images reconstituées (POST /admin/import/card-overlay) ———
+
+export interface CardOverlayRequest {
+  language: Language
+  /** Carte sans image (ex. carte de deck Académie de Combat). */
+  target: string
+  /** Carte d'origine dont l'image (déjà dans R2) est reprise. */
+  origin: string
+  place: OverlayPlace
+  /** Calque PNG à coller (tampon du deck). */
+  overlay: Uint8Array
+  /** Rend l'image composée sans rien écrire. */
+  dryRun: boolean
+}
+
+export type CardOverlayOutcome = (SetMediaOutcome & { low?: string }) | { status: 'preview'; bytes: Uint8Array }
+
+/**
+ * Image reconstituée d'une carte : l'image de sa carte d'origine (même illustration, même texte),
+ * à laquelle on colle un calque (tampon du deck), puis enregistrée comme `POST /admin/import/image`
+ * (image principale et petite image). L'adresse d'origine enregistrée commence par `reconstitution:`
+ * pour que ces images restent reconnaissables et remplaçables par un vrai scan.
+ */
+export async function storeCardOverlay(
+  db: Db,
+  bucket: R2Bucket,
+  config: Pick<Config, 'minImageBytes' | 'maxImageBytes'>,
+  request: CardOverlayRequest,
+  now: () => number,
+): Promise<CardOverlayOutcome> {
+  const card = await db.first<{ image_status: string; image_r2_key: string | null }>(`SELECT image_status, image_r2_key FROM cards WHERE id = ?1`, internalId(request.language, request.target))
+  if (!card) return { status: 'not_found', reason: `carte ${request.language}/${request.target} inconnue` }
+  if (!request.dryRun && VALID.includes(card.image_status) && card.image_r2_key) return { status: 'unchanged', key: card.image_r2_key, reason: 'image déjà présente' }
+  const origin = await db.first<{ image_status: string; image_r2_key: string | null }>(`SELECT image_status, image_r2_key FROM cards WHERE id = ?1`, internalId(request.language, request.origin))
+  if (!origin || !VALID.includes(origin.image_status) || !origin.image_r2_key) return { status: 'not_found', reason: `carte d'origine ${request.language}/${request.origin} sans image` }
+  db.usage.r2Reads++
+  const object = await bucket.get(origin.image_r2_key)
+  if (!object) return { status: 'not_found', reason: `objet R2 absent : ${origin.image_r2_key}` }
+  const base = new Uint8Array(await object.arrayBuffer())
+  const [main, low] = await composeOverlay(base, request.overlay, request.place, [CARD_MAIN, CARD_LOW])
+  if (!main || !low) throw new Error('composition incomplète')
+  if (request.dryRun) return { status: 'preview', bytes: main }
+  const sourceUrl = `reconstitution:${request.language}/${request.origin}`
+  const stored = await storeImage(db, bucket, config, { kind: 'main', language: request.language, target: request.target, sourceUrl, bytes: main }, now())
+  if (!['stored', 'reconciled', 'unchanged'].includes(stored.status)) return stored
+  const lowStored = await storeImage(db, bucket, config, { kind: 'low', language: request.language, target: request.target, sourceUrl, bytes: low }, now())
+  return { ...stored, low: lowStored.status }
+}
+const VALID = ['downloaded', 'recovered_from_cdn', 'already_present']
 
 /** Source d'une adresse parmi `sources` ; `InputError` (400) si l'adresse n'est pas exactement au format attendu. */
 function pickSource(sources: readonly MediaSource[], sourceUrl: string, label: string): MediaSource {

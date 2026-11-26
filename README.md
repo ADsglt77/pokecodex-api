@@ -341,6 +341,7 @@ Ou avec curl : `curl -s -H "Authorization: Bearer $(cat .secrets/admin-token.txt
 | `POST /admin/import/catalog` | ajoute séries, extensions et cartes d'une autre source (corps JSON, voir « Ajouts hors TCGdex ») ; ne modifie jamais une ligne existante |
 | `POST /admin/import/image` | envoie l'image d'une carte ou le logo d'une extension (corps WebP ; `?kind=main\|low\|logo&language=&target=&source=`) ; n'écrase jamais rien |
 | `POST /admin/import/symbol` | copie le symbole d'une extension qui n'en a pas : le Worker télécharge lui-même `source` (TCGdex `univ/…/symbol.png\|webp` ou Pokécardex `symboles[_jp]/<code>.png`), le convertit en WebP (liaison Images) ; `?language=&target=&source=` ; 424 si la source n'a pas le fichier, 502 si elle est en panne |
+| `POST /admin/import/card-overlay` | image reconstituée d'une carte sans image : image de sa carte d'origine (`origin`, déjà dans R2) + calque PNG envoyé dans le corps de la requête (tampon de deck), collé à la position relative `x`, `y`, largeur `w` ; WebP principal et petite image ; `image_source_url` = `reconstitution:<l>/<origine>` ; `dryRun=1` rend l'image sans rien écrire |
 | `POST /admin/import/card` | copie l'image d'une carte qui n'en a aucune (et sa petite image) : le Worker télécharge `source` (Poképédia `images/<h>/<hh>/<fichier>.png\|jpg` ou `assets.pokemon.com`), la convertit en WebP, puis l'écrit comme `POST /admin/import/image` ; `?language=&target=<carte>&source=` |
 | `POST /admin/import/logo` | copie le logo d'une extension qui n'en a pas, de la même façon : `source` = logo TCGdex d'une autre langue (`<langue>/<série>/<ext>/logo.webp\|png`) ou PNG de Poképédia, 52poke ou Bulbagarden (fichiers MediaWiki) ; mêmes paramètres et codes de retour |
 
@@ -394,6 +395,13 @@ d'écarter Pokécardex). Rien n'est téléchargé : tout part de la copie locale
   `logo-urls <plan.json>` et `card-urls <plan.json>` demandent au Worker chaque symbole, logo ou
   image de carte, une adresse à la fois (3 s d'écart chez Pokécardex, 0,3 s chez TCGdex, 0,7 s chez
   Poképédia).
+- **Cartes Académie de Combat reconstituées** (26/11/2026) : 395 cartes de deck réimprimant une carte
+  existante reçoivent l'image FR de la carte d'origine (même nom, illustrateur et numéro imprimé ;
+  Énergies de base de la même époque) avec le tampon du deck (silhouette et pastille numérotée, découpés
+  sur un scan de référence par deck), composée par le Worker (`composeOverlay`,
+  `POST /admin/import/card-overlay`). Repérables par `image_source_url LIKE 'reconstitution:%'`,
+  remplaçables par un vrai scan. Tampons, calques et plan : `.local/adc/` ; envoi :
+  `scripts/import-manual.mjs card-overlays <plan.json>`.
 - **Images FR de Poképédia** (25/11/2026) : 3 515 cartes FR sans image, associées par l'API du wiki
   (nom de fichier par extension et numéro, numéro imprimé pour le Pack Récompense), vérifiées sur
   des planches de miniatures (aucun filigrane ; photos, cartes d'une autre langue et Pack Récompense

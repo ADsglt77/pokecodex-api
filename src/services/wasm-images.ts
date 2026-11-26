@@ -64,6 +64,17 @@ async function decode(bytes: Uint8Array): Promise<ImageData> {
   return image
 }
 
+/** Image réduite (jamais agrandie) à `maxSide`, encodée en WebP (sans perte si `quality` ≥ 100). */
+async function encodeSized(image: ImageData, maxSide: number, quality: number): Promise<Uint8Array> {
+  const scale = Math.min(1, maxSide / Math.max(image.width, image.height))
+  const sized =
+    scale < 1
+      ? await resize(image, { width: Math.max(1, Math.round(image.width * scale)), height: Math.max(1, Math.round(image.height * scale)), method: 'lanczos3', fitMethod: 'stretch', premultiply: true, linearRGB: true })
+      : image
+  const out = await encodeWebp(sized, quality >= 100 ? { lossless: 1, quality: 100 } : { quality })
+  return new Uint8Array(out)
+}
+
 export function wasmImagesAdapter(): SetMediaImages {
   return {
     async info(bytes) {
@@ -71,14 +82,46 @@ export function wasmImagesAdapter(): SetMediaImages {
       return { format: isPng(bytes) ? 'image/png' : isJpeg(bytes) ? 'image/jpeg' : 'image/webp', width: image.width, height: image.height }
     },
     async toWebp(bytes, maxSide, quality = 100) {
-      const image = await decode(bytes)
-      const scale = Math.min(1, maxSide / Math.max(image.width, image.height))
-      const sized =
-        scale < 1
-          ? await resize(image, { width: Math.max(1, Math.round(image.width * scale)), height: Math.max(1, Math.round(image.height * scale)), method: 'lanczos3', fitMethod: 'stretch', premultiply: true, linearRGB: true })
-          : image
-      const out = await encodeWebp(sized, quality >= 100 ? { lossless: 1, quality: 100 } : { quality })
-      return new Uint8Array(out)
+      return encodeSized(await decode(bytes), maxSide, quality)
     },
   }
+}
+
+/** Position d'un calque sur une carte, relative à ses dimensions (coin haut gauche, largeur). */
+export interface OverlayPlace {
+  x: number
+  y: number
+  w: number
+}
+
+/**
+ * Colle `overlay` (PNG à fond transparent, ex. tampon de deck) sur l'image `base` à la position
+ * relative `place` (hauteur proportionnelle), puis encode le résultat en WebP pour chaque sortie.
+ */
+export async function composeOverlay(base: Uint8Array, overlay: Uint8Array, place: OverlayPlace, outputs: readonly { maxSide: number; quality: number }[]): Promise<Uint8Array[]> {
+  await initCodecs()
+  const card = await decode(base)
+  const over = isPng(overlay) ? await decodePng(buffer(overlay)) : await decode(overlay)
+  const ow = Math.max(1, Math.round(place.w * card.width))
+  const oh = Math.max(1, Math.round((over.height * ow) / over.width))
+  const layer = ow === over.width && oh === over.height ? over : await resize(over, { width: ow, height: oh, method: 'lanczos3', fitMethod: 'stretch', premultiply: true, linearRGB: false })
+  const ox = Math.round(place.x * card.width)
+  const oy = Math.round(place.y * card.height)
+  const out = new Uint8ClampedArray(card.data)
+  for (let y = 0; y < oh; y++) {
+    const ty = oy + y
+    if (ty < 0 || ty >= card.height) continue
+    for (let x = 0; x < ow; x++) {
+      const tx = ox + x
+      if (tx < 0 || tx >= card.width) continue
+      const i = (y * ow + x) * 4
+      const j = (ty * card.width + tx) * 4
+      const a = (layer.data[i + 3] ?? 0) / 255
+      if (!a) continue
+      for (let k = 0; k < 3; k++) out[j + k] = Math.round((layer.data[i + k] ?? 0) * a + (out[j + k] ?? 0) * (1 - a))
+      out[j + 3] = Math.max(out[j + 3] ?? 0, layer.data[i + 3] ?? 0)
+    }
+  }
+  const composed = new ImageDataShim(out, card.width, card.height) as unknown as ImageData
+  return Promise.all(outputs.map((o) => encodeSized(composed, o.maxSide, o.quality)))
 }
