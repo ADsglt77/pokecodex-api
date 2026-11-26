@@ -19,7 +19,7 @@ import { ASSETS_HOST } from '../tcgdex/client'
 import { checkWebp } from '../tcgdex/images'
 import { toHex } from '../utils/hash'
 import { BodyTooLargeError, fetchClassified, readCapped } from '../utils/http'
-import { internalId, setLogoKey, setSymbolKey } from '../utils/keys'
+import { cardImageKey, internalId, lowImageKey, setLogoKey, setSymbolKey } from '../utils/keys'
 import { errorMessage } from '../utils/log'
 import { iso } from '../utils/time'
 import { InputError, MANUAL_SOURCE, storeImage, type ImageOutcome } from './manual-import'
@@ -323,7 +323,8 @@ export interface CardOverlayRequest {
   language: Language
   /** Carte sans image (ex. carte de deck Académie de Combat). */
   target: string
-  /** Carte d'origine dont l'image (déjà dans R2) est reprise. */
+  /** Carte d'origine dont l'image (déjà dans R2) est reprise, ou adresse d'une image de `CARD_SOURCES`
+   *  que le Worker télécharge lui-même (ex. Énergie de base de Poképédia). */
   origin: string
   place: OverlayPlace
   /** Calque PNG à coller (tampon du deck). */
@@ -343,29 +344,195 @@ export type CardOverlayOutcome = (SetMediaOutcome & { low?: string }) | { status
 export async function storeCardOverlay(
   db: Db,
   bucket: R2Bucket,
-  config: Pick<Config, 'minImageBytes' | 'maxImageBytes'>,
+  config: Pick<Config, 'minImageBytes' | 'maxImageBytes' | 'fetchTimeoutMs'>,
+  fetcher: typeof fetch,
   request: CardOverlayRequest,
   now: () => number,
 ): Promise<CardOverlayOutcome> {
+  const fromUrl = request.origin.startsWith('https://')
+  const source = fromUrl ? pickSource(CARD_SOURCES, request.origin, 'une image de carte') : null
   const card = await db.first<{ image_status: string; image_r2_key: string | null }>(`SELECT image_status, image_r2_key FROM cards WHERE id = ?1`, internalId(request.language, request.target))
   if (!card) return { status: 'not_found', reason: `carte ${request.language}/${request.target} inconnue` }
   if (!request.dryRun && VALID.includes(card.image_status) && card.image_r2_key) return { status: 'unchanged', key: card.image_r2_key, reason: 'image déjà présente' }
-  const origin = await db.first<{ image_status: string; image_r2_key: string | null }>(`SELECT image_status, image_r2_key FROM cards WHERE id = ?1`, internalId(request.language, request.origin))
-  if (!origin || !VALID.includes(origin.image_status) || !origin.image_r2_key) return { status: 'not_found', reason: `carte d'origine ${request.language}/${request.origin} sans image` }
-  db.usage.r2Reads++
-  const object = await bucket.get(origin.image_r2_key)
-  if (!object) return { status: 'not_found', reason: `objet R2 absent : ${origin.image_r2_key}` }
-  const base = new Uint8Array(await object.arrayBuffer())
+  let base: Uint8Array
+  if (source) {
+    const download = await downloadSource(db, fetcher, source, request.origin, config, now)
+    if ('status' in download) return download
+    base = download.bytes
+  } else {
+    const origin = await db.first<{ image_status: string; image_r2_key: string | null }>(`SELECT image_status, image_r2_key FROM cards WHERE id = ?1`, internalId(request.language, request.origin))
+    if (!origin || !VALID.includes(origin.image_status) || !origin.image_r2_key) return { status: 'not_found', reason: `carte d'origine ${request.language}/${request.origin} sans image` }
+    db.usage.r2Reads++
+    const object = await bucket.get(origin.image_r2_key)
+    if (!object) return { status: 'not_found', reason: `objet R2 absent : ${origin.image_r2_key}` }
+    base = new Uint8Array(await object.arrayBuffer())
+  }
   const [main, low] = await composeOverlay(base, request.overlay, request.place, [CARD_MAIN, CARD_LOW])
   if (!main || !low) throw new Error('composition incomplète')
   if (request.dryRun) return { status: 'preview', bytes: main }
-  const sourceUrl = `reconstitution:${request.language}/${request.origin}`
+  const sourceUrl = fromUrl ? `reconstitution:${request.origin}` : `reconstitution:${request.language}/${request.origin}`
   const stored = await storeImage(db, bucket, config, { kind: 'main', language: request.language, target: request.target, sourceUrl, bytes: main }, now())
   if (!['stored', 'reconciled', 'unchanged'].includes(stored.status)) return stored
   const lowStored = await storeImage(db, bucket, config, { kind: 'low', language: request.language, target: request.target, sourceUrl, bytes: low }, now())
   return { ...stored, low: lowStored.status }
 }
 const VALID = ['downloaded', 'recovered_from_cdn', 'already_present']
+
+// ——— Remplacement de l'image d'une carte (POST /admin/import/card-replace et card-replace-apply) ———
+
+/**
+ * Remplacer une image déjà en base (accord de l'utilisateur du 26/11/2026 : rendus Poképédia plus
+ * grands ou plus justes) se fait en deux temps, sans jamais écraser ni effacer quoi que ce soit :
+ * 1. `replaceCardImage` télécharge l'image, la convertit et l'écrit sous une NOUVELLE clé
+ *    (`<carte>.p<12 hex du SHA-256>.webp` et sa petite image `.low.webp`) ; D1 n'est pas touché, le
+ *    site garde l'ancienne image (sauf `apply`, pour une image déjà vérifiée) ;
+ * 2. `applyCardReplacement` bascule la carte sur ces objets une fois l'image vérifiée, à condition que
+ *    son image soit toujours celle attendue (`expect`). L'ancien objet reste dans R2.
+ */
+export interface CardReplaceRequest {
+  language: Language
+  target: string
+  sourceUrl: string
+  /** Clé R2 actuelle de l'image principale de la carte : rien n'est fait si elle a changé. */
+  expect: string
+  /** Bascule aussitôt la carte sur la nouvelle image (image déjà vérifiée). */
+  apply: boolean
+}
+
+export type CardReplaceOutcome =
+  | { status: 'staged' | 'replaced'; key: string; lowKey: string; size: number; sha256: string; width?: number; height?: number }
+  | SetMediaOutcome
+
+interface ReplaceRow {
+  id: string
+  tcgdex_id: string
+  set_tcgdex: string | null
+  image_status: string
+  image_r2_key: string | null
+}
+
+/** La carte, si son image actuelle est bien celle attendue ; sinon l'issue à renvoyer. */
+async function replaceTarget(db: Db, language: Language, target: string, expect: string): Promise<{ row: ReplaceRow & { set_tcgdex: string }; base: string } | SetMediaOutcome> {
+  const row = await db.first<ReplaceRow>(
+    `SELECT c.id, c.tcgdex_id, s.tcgdex_id AS set_tcgdex, c.image_status, c.image_r2_key FROM cards c LEFT JOIN sets s ON s.id = c.set_id WHERE c.id = ?1`,
+    internalId(language, target),
+  )
+  if (!row || !row.set_tcgdex) return { status: 'not_found', reason: `carte ${language}/${target} inconnue` }
+  if (!VALID.includes(row.image_status) || row.image_r2_key !== expect) {
+    return { status: 'conflict', reason: `image actuelle ${row.image_r2_key ?? 'absente'} ≠ attendue ${expect} : rien n’est remplacé` }
+  }
+  const base = cardImageKey(language, row.set_tcgdex, row.tcgdex_id).slice(0, -'.webp'.length)
+  return { row: { ...row, set_tcgdex: row.set_tcgdex }, base }
+}
+
+/** Écrit un objet s'il est absent ; présent avec le même contenu → réutilisé ; autre contenu → raison du refus. */
+async function putOnce(db: Db, bucket: R2Bucket, key: string, bytes: Uint8Array, check: { sha256: string; md5: string }, meta: Record<string, string>): Promise<number | string> {
+  if (!key.startsWith(IMAGES_PREFIX)) throw new Error(`clé R2 hors du préfixe ${IMAGES_PREFIX} : ${key}`)
+  db.usage.r2Reads++
+  const existing = await bucket.head(key)
+  if (existing) return existing.customMetadata?.sha256 === check.sha256 ? existing.size : `objet R2 déjà présent à ${key}, d’un autre contenu : jamais écrasé`
+  db.usage.r2Writes++
+  const stored = await bucket.put(key, bytes, {
+    sha256: check.sha256,
+    httpMetadata: { contentType: 'image/webp', cacheControl: 'public, max-age=31536000, immutable' },
+    customMetadata: { ...meta, source: MANUAL_SOURCE, sha256: check.sha256, md5: check.md5 },
+    onlyIf: { etagDoesNotMatch: '*' },
+  })
+  if (!stored) return `objet R2 apparu à ${key} pendant l’envoi : jamais écrasé`
+  db.usage.bytesStored += stored.size
+  return stored.size
+}
+
+/** Étape 1 : nouvelle image écrite sous une nouvelle clé (et la carte basculée si `apply`). */
+export async function replaceCardImage(
+  db: Db,
+  bucket: R2Bucket,
+  config: Pick<Config, 'minImageBytes' | 'maxImageBytes' | 'fetchTimeoutMs'>,
+  fetcher: typeof fetch,
+  images: SetMediaImages,
+  request: CardReplaceRequest,
+  now: () => number,
+): Promise<CardReplaceOutcome> {
+  const source = pickSource(CARD_SOURCES, request.sourceUrl, 'une image de carte')
+  const target = await replaceTarget(db, request.language, request.target, request.expect)
+  if ('status' in target) return target
+  const download = await downloadSource(db, fetcher, source, request.sourceUrl, config, now)
+  if ('status' in download) return download
+  const { bytes } = download
+  if (!isPng(bytes) && !isJpeg(bytes) && !isWebp(bytes)) return { status: 'invalid', reason: 'ni PNG, ni JPEG, ni WebP (signature absente)' }
+  let size: { width: number; height: number }
+  try {
+    size = await images.info(bytes)
+  } catch (error) {
+    if (!isFileImageError(error)) throw error
+    return { status: 'invalid', reason: `image illisible : ${errorMessage(error)}` }
+  }
+  if (size.width < CARD_MIN_SIDE || size.height < CARD_MIN_SIDE) return { status: 'invalid', reason: `image trop petite (${size.width}×${size.height})` }
+  const main = await images.toWebp(bytes, CARD_MAIN.maxSide, CARD_MAIN.quality)
+  const low = await images.toWebp(bytes, CARD_LOW.maxSide, CARD_LOW.quality)
+  const webp = (b: Uint8Array) => checkWebp(b, new Headers({ 'content-type': 'image/webp', 'content-length': String(b.byteLength) }), config)
+  const [mainCheck, lowCheck] = [await webp(main), await webp(low)]
+  if (!mainCheck.ok) return { status: 'invalid', reason: `conversion : ${mainCheck.reason}` }
+  if (!lowCheck.ok) return { status: 'invalid', reason: `conversion (petite image) : ${lowCheck.reason}` }
+  const key = `${target.base}.p${mainCheck.sha256.slice(0, 12)}.webp`
+  const lowKey = lowImageKey(key)
+  if (!lowKey) throw new Error(`clé de petite image impossible : ${key}`)
+  const meta = { tcgdexId: target.row.tcgdex_id, sourceUrl: request.sourceUrl, replaces: request.expect, width: String(size.width), height: String(size.height) }
+  const mainSize = await putOnce(db, bucket, key, main, mainCheck, { ...meta, quality: 'high' })
+  if (typeof mainSize === 'string') return { status: 'conflict', reason: mainSize }
+  const lowSize = await putOnce(db, bucket, lowKey, low, lowCheck, { ...meta, variant: 'low' })
+  if (typeof lowSize === 'string') return { status: 'conflict', reason: lowSize }
+  if (request.apply) return applyCardReplacement(db, bucket, { language: request.language, target: request.target, key, expect: request.expect }, now)
+  return { status: 'staged', key, lowKey, size: mainSize, sha256: mainCheck.sha256, width: size.width, height: size.height }
+}
+
+/** Étape 2 : la carte passe sur l'image écrite à `key` par l'étape 1 (aucun téléchargement). */
+export async function applyCardReplacement(
+  db: Db,
+  bucket: R2Bucket,
+  request: { language: Language; target: string; key: string; expect: string },
+  now: () => number,
+): Promise<CardReplaceOutcome> {
+  const target = await replaceTarget(db, request.language, request.target, request.expect)
+  if ('status' in target) return target
+  if (!request.key.startsWith(`${target.base}.p`) || !/\.p[0-9a-f]{12}\.webp$/.test(request.key)) {
+    throw new InputError(`clé de remplacement inattendue pour ${request.language}/${request.target} : ${request.key}`)
+  }
+  const lowKey = lowImageKey(request.key)
+  if (!lowKey) throw new InputError(`clé inattendue : ${request.key}`)
+  db.usage.r2Reads += 2
+  const [main, low] = await Promise.all([bucket.head(request.key), bucket.head(lowKey)])
+  const mainMeta = main?.customMetadata
+  const lowMeta = low?.customMetadata
+  if (!main || !low || !mainMeta?.sha256 || !lowMeta?.sha256) return { status: 'not_found', reason: `image préparée absente : ${request.key}` }
+  if (mainMeta.tcgdexId !== target.row.tcgdex_id || lowMeta.tcgdexId !== target.row.tcgdex_id || !mainMeta.sourceUrl) {
+    return { status: 'conflict', reason: `objet ${request.key} étranger à cette carte` }
+  }
+  const at = iso(now())
+  const res = await db.batch([
+    db.stmt(
+      `UPDATE cards SET image_status = 'downloaded', image_source = NULL, image_source_url = ?3, image_r2_key = ?4,
+         image_quality = 'high', image_file_size = ?5, image_sha256 = ?6, image_downloaded_at = ?7, image_checked_at = ?7,
+         image_tested_urls = '[]', image_http_status = NULL, image_failure_reason = NULL, image_provider = ?8,
+         image_low_status = 'downloaded', image_low_r2_key = ?9, image_low_checked_at = ?7, image_low_file_size = ?10,
+         image_low_sha256 = ?11, image_low_failure_reason = NULL, updated_at = ?7
+       WHERE id = ?1 AND image_r2_key = ?2 AND image_status IN ('downloaded', 'recovered_from_cdn', 'already_present')`,
+      target.row.id,
+      request.expect,
+      mainMeta.sourceUrl,
+      request.key,
+      main.size,
+      mainMeta.sha256,
+      at,
+      MANUAL_SOURCE,
+      lowKey,
+      low.size,
+      lowMeta.sha256,
+    ),
+  ])
+  if (!res[0]?.meta.changes) return { status: 'conflict', reason: 'la carte a changé entre-temps : rien n’est remplacé' }
+  return { status: 'replaced', key: request.key, lowKey, size: main.size, sha256: mainMeta.sha256 }
+}
 
 /** Source d'une adresse parmi `sources` ; `InputError` (400) si l'adresse n'est pas exactement au format attendu. */
 function pickSource(sources: readonly MediaSource[], sourceUrl: string, label: string): MediaSource {

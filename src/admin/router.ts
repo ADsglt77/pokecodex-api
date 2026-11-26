@@ -8,6 +8,7 @@
  *   GET  /admin/reports                rapports enregistrés dans R2 (?prefix=latest/|history/&cursor=)
  *   GET  /admin/reports/<chemin>       contenu d'un rapport (ex. latest/missing_fr.csv)
  *   GET  /admin/r2                     objets R2 de l'importateur (?prefix=cards/fr/swsh3/&limit=)
+ *   GET  /admin/r2/object              contenu d'une image (?key=cards/…, ?bytes=N : N premiers octets), pour la revue
  *   POST /admin/sync/start             démarre une synchronisation (?language=fr,ja&sets=swsh3,SV1a)
  *   POST /admin/sync/pause             met en pause
  *   POST /admin/sync/resume            reprend (lève aussi une attente imposée, signalée en retour)
@@ -32,7 +33,7 @@ import { ERROR_IMAGE_STATUSES, MISSING_IMAGE_STATUSES } from '../repositories/ca
 import { enqueueStmts } from '../repositories/jobs'
 import { importCatalog, InputError, MAX_CATALOG_BYTES, storeImage, type ImageKind } from '../services/manual-import'
 import { failedJobs, problemCards, setCoverage } from '../services/reports'
-import { storeCardFromUrl, storeCardOverlay, storeSetMedia, type SetMediaImages } from '../services/set-media-import'
+import { applyCardReplacement, replaceCardImage, storeCardFromUrl, storeCardOverlay, storeSetMedia, type SetMediaImages } from '../services/set-media-import'
 import { runTick } from '../services/runner'
 import { collectStats, formatStatus } from '../services/stats'
 import { backfillMedia, cancelSync, pauseSync, resumeSync, retryMissing, startSync } from '../services/sync'
@@ -75,7 +76,7 @@ export const json = (body: unknown, status = 200): Response =>
 const text = (body: string, status = 200): Response =>
   new Response(body, { status, headers: { 'content-type': 'text/plain; charset=utf-8', ...SECURITY_HEADERS } })
 
-const GET_ROUTES = ['/admin/status', '/admin/stats', '/admin/missing', '/admin/errors', '/admin/reports', '/admin/r2']
+const GET_ROUTES = ['/admin/status', '/admin/stats', '/admin/missing', '/admin/errors', '/admin/reports', '/admin/r2', '/admin/r2/object']
 const POST_ROUTES = [
   '/admin/sync/start',
   '/admin/sync/pause',
@@ -92,6 +93,8 @@ const POST_ROUTES = [
   '/admin/import/logo',
   '/admin/import/card',
   '/admin/import/card-overlay',
+  '/admin/import/card-replace',
+  '/admin/import/card-replace-apply',
 ]
 
 /** Langues demandées (`?language=fr,ja`), toutes par défaut ; `null` si une valeur est inconnue. */
@@ -177,6 +180,17 @@ export async function handleAdmin(request: Request, deps: AdminDeps): Promise<Re
         const object = await deps.bucket.get(`${REPORTS_PREFIX}${relative}`)
         if (!object) return json({ error: 'rapport introuvable' }, 404)
         return new Response(object.body, { headers: { 'content-type': object.httpMetadata?.contentType ?? 'application/octet-stream', ...SECURITY_HEADERS } })
+      }
+      if (path === '/admin/r2/object') {
+        // Revue à la main des images : lecture seule, clé exacte sous cards/ ; ?bytes=N pour l'en-tête seul.
+        const key = url.searchParams.get('key') ?? ''
+        if (!key.startsWith(IMAGES_PREFIX) || key.includes('..')) return json({ error: `clé limitée à ${IMAGES_PREFIX}` }, 400)
+        const length = url.searchParams.has('bytes') ? intParam(url, 'bytes', 64, 1, 65_536) : null
+        const object = await deps.bucket.get(key, length ? { range: { offset: 0, length } } : undefined)
+        if (!object) return json({ error: 'objet absent' }, 404)
+        return new Response(object.body, {
+          headers: { 'content-type': object.httpMetadata?.contentType ?? 'application/octet-stream', 'x-object-size': String(object.size), ...SECURITY_HEADERS },
+        })
       }
       if (path === '/admin/r2') {
         // Vérification à distance des objets écrits (métadonnées seulement, jamais le contenu).
@@ -279,11 +293,11 @@ export async function handleAdmin(request: Request, deps: AdminDeps): Promise<Re
         const origin = url.searchParams.get('origin') ?? ''
         const place = { x: Number(url.searchParams.get('x')), y: Number(url.searchParams.get('y')), w: Number(url.searchParams.get('w')) }
         if (!isLanguage(language)) return json({ error: 'langue inconnue (fr ou ja)' }, 400)
-        if (!target || target.length > 80 || !origin || origin.length > 80) return json({ error: 'target et origin attendus' }, 400)
+        if (!target || target.length > 80 || !origin || origin.length > 400) return json({ error: 'target et origin attendus' }, 400)
         if (![place.x, place.y, place.w].every((v) => Number.isFinite(v) && v >= 0 && v <= 1) || place.w === 0) return json({ error: 'x, y, w : nombres entre 0 et 1' }, 400)
         const overlay = await readBody(request, 2_000_000)
         if (!overlay) return json({ error: 'corps PNG attendu (2 Mo au plus)' }, 413)
-        const outcome = await storeCardOverlay(db, deps.bucket, config, { language, target, origin, place, overlay, dryRun: url.searchParams.get('dryRun') === '1' }, now)
+        const outcome = await storeCardOverlay(db, deps.bucket, config, deps.fetcher, { language, target, origin, place, overlay, dryRun: url.searchParams.get('dryRun') === '1' }, now)
         if (outcome.status === 'preview') return new Response(outcome.bytes, { headers: { 'content-type': 'image/webp', ...SECURITY_HEADERS } })
         const status = { stored: 201, reconciled: 200, unchanged: 200, conflict: 409, not_found: 404, invalid: 422, source_not_found: 424, source_refused: 424, source_error: 502 }[outcome.status]
         return json(outcome, status)
@@ -296,6 +310,24 @@ export async function handleAdmin(request: Request, deps: AdminDeps): Promise<Re
         if (!deps.mediaImages) return json({ error: 'liaison Images absente : conversion impossible' }, 500)
         const outcome = await storeCardFromUrl(db, deps.bucket, config, deps.fetcher, deps.mediaImages, { language, target, sourceUrl: url.searchParams.get('source') ?? '' }, now)
         const status = { stored: 201, reconciled: 200, unchanged: 200, conflict: 409, not_found: 404, invalid: 422, source_not_found: 424, source_refused: 424, source_error: 502 }[outcome.status]
+        return json(outcome, status)
+      }
+      if (path === '/admin/import/card-replace' || path === '/admin/import/card-replace-apply') {
+        const language = url.searchParams.get('language')
+        const target = url.searchParams.get('target') ?? ''
+        const expect = url.searchParams.get('expect') ?? ''
+        if (!isLanguage(language)) return json({ error: 'langue inconnue (fr ou ja)' }, 400)
+        if (!target || target.length > 80) return json({ error: 'target manquant' }, 400)
+        if (!expect.startsWith(IMAGES_PREFIX) || expect.length > 300) return json({ error: `expect : clé R2 actuelle de l’image (sous ${IMAGES_PREFIX})` }, 400)
+        let outcome
+        if (path === '/admin/import/card-replace') {
+          if (!deps.mediaImages) return json({ error: 'liaison Images absente : conversion impossible' }, 500)
+          const request = { language, target, expect, sourceUrl: url.searchParams.get('source') ?? '', apply: flagParam(url, 'apply') }
+          outcome = await replaceCardImage(db, deps.bucket, config, deps.fetcher, deps.mediaImages, request, now)
+        } else {
+          outcome = await applyCardReplacement(db, deps.bucket, { language, target, expect, key: url.searchParams.get('key') ?? '' }, now)
+        }
+        const status = { staged: 201, replaced: 200, stored: 201, reconciled: 200, unchanged: 200, conflict: 409, not_found: 404, invalid: 422, source_not_found: 424, source_refused: 424, source_error: 502 }[outcome.status]
         return json(outcome, status)
       }
       if (path === '/admin/import/symbol' || path === '/admin/import/logo') {

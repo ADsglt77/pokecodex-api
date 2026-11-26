@@ -24,8 +24,12 @@ sur un Worker Cloudflare indépendant (`pokecodex-importer`). Tout le fonctionne
   (`POST /admin/import/logo`, 25/11/2026) et les images de cartes (`POST /admin/import/card`,
   25/11/2026 : Poképédia et assets.pokemon.com, après vérification des planches de miniatures) ;
   code : `src/services/set-media-import.ts`. Images reconstituées (`POST /admin/import/card-overlay`,
-  26/11/2026) : image d'une carte d'origine déjà dans R2 + tampon de deck, composées dans le Worker
-  (`composeOverlay` de `wasm-images.ts`) ; `image_source_url` = `reconstitution:<l>/<origine>`.
+  26/11/2026) : image d'une carte d'origine déjà dans R2 (ou, si `origin` est une adresse de
+  `CARD_SOURCES`, image Poképédia téléchargée par le Worker, ex. Énergie de base) + tampon de deck,
+  composées dans le Worker (`composeOverlay` de `wasm-images.ts`) ; `image_source_url` =
+  `reconstitution:<l>/<origine>` ou `reconstitution:<adresse>`.
+  Remplacement d'une image existante (`POST /admin/import/card-replace` puis `card-replace-apply`,
+  26/11/2026) : nouvelle clé `<carte>.p<sha>.webp`, bascule conditionnée par `expect`, ancien objet gardé.
 
 ## Environnement
 
@@ -77,7 +81,10 @@ convertirait `/admin/…` en chemin Windows).
   (`src/services/wasm-images.ts` : PNG, JPEG, WebP, redimensionnement lanczos3, `ImageData` simulé),
   depuis que le quota gratuit de la liaison Cloudflare Images (5 000 transformations par mois) a été
   épuisé le 25/11/2026. La liaison `IMAGES` et `imagesBindingAdapter` restent déclarées mais ne sont
-  plus utilisées. Un PNG peut faire planter le codec (`RuntimeError: unreachable`, `fr:tk-ex-latia-7`).
+  plus utilisées. Un PNG peut faire planter le codec (`RuntimeError: unreachable`, `fr:tk-ex-latia-7`) :
+  un isolat n'a que 128 Mo et la mémoire d'un codec ne rétrécit jamais ; un codec planté le reste
+  pour tout l'isolat. D'où `MAX_PIXELS` (6 Mpx, lu dans l'en-tête) et la réduction préalable en
+  JavaScript à 1 024 px de côté (`areaShrink`) de toute image décodée plus grande.
   Après tout changement de `wrangler.jsonc`, `npx wrangler types`.
 - **TCGdex** (sondé le 13/11/2026) : pas de limite publiée mais « be considerate » (≤ 4 requêtes/s) ;
   encoder chaque segment d'URL (`exu-%3F` → `exu-%253F`, `SM1+` → `SM1%2B`) ; l'API renvoie parfois
