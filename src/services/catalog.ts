@@ -147,6 +147,8 @@ function needsDetail(card: ExistingCard, nowMs: number, refreshDays: number): bo
 /** Faut-il (re)chercher l'image de cette carte ? */
 function needsImage(card: ExistingCard, imageChanged: boolean, nowMs: number, recheckDays: number): boolean {
   if (isValidImageStatus(card.image_status)) return false
+  // Image ajoutée, remplacée ou retirée par l'API d'import : jamais reprise par la synchronisation.
+  if (card.image_provider !== null) return false
   if (card.image_status === 'pending' || imageChanged || !card.image_checked_at) return true
   return nowMs - Date.parse(card.image_checked_at) > recheckDays * DAY_MS
 }

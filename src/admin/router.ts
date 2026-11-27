@@ -25,6 +25,11 @@
  *                                      (?language=fr|ja&target=<id>&source=<adresse TCGdex ou Pokécardex>)
  *   POST /admin/import/logo            copie le logo d'une extension, que le Worker télécharge lui-même
  *                                      (?language=fr|ja&target=<id>&source=<adresse TCGdex>)
+ *   POST /admin/import/card-low        petite image calculée depuis l'image principale (?language=&target=)
+ *   POST /admin/import/card-replace-upload  remplace l'image par un WebP envoyé (?language=&target=&expect=&source=&apply=1)
+ *   POST /admin/import/card-remove     retire l'image d'une carte (?language=&target=&expect=<clé>&reason=)
+ *   POST /admin/r2/delete              efface des objets d'images qu'aucune ligne de D1 ne référence
+ *                                      (corps JSON {"keys": [...]}, 500 clés au plus)
  */
 
 import { IMAGES_PREFIX, isLanguage, REPORTS_PREFIX, type Config, type Language } from '../config'
@@ -33,7 +38,7 @@ import { ERROR_IMAGE_STATUSES, MISSING_IMAGE_STATUSES } from '../repositories/ca
 import { enqueueStmts } from '../repositories/jobs'
 import { importCatalog, InputError, MAX_CATALOG_BYTES, storeImage, type ImageKind } from '../services/manual-import'
 import { failedJobs, problemCards, setCoverage } from '../services/reports'
-import { applyCardReplacement, replaceCardImage, storeCardFromUrl, storeCardOverlay, storeSetMedia, type SetMediaImages } from '../services/set-media-import'
+import { applyCardReplacement, deleteUnreferenced, EXPECT_NONE, MAX_DELETE_KEYS, removeCardImage, replaceCardFromUpload, replaceCardImage, storeCardFromUrl, storeCardOverlay, storeLowFromMain, storeSetMedia, type SetMediaImages } from '../services/set-media-import'
 import { runTick } from '../services/runner'
 import { collectStats, formatStatus } from '../services/stats'
 import { backfillMedia, cancelSync, pauseSync, resumeSync, retryMissing, startSync } from '../services/sync'
@@ -95,6 +100,10 @@ const POST_ROUTES = [
   '/admin/import/card-overlay',
   '/admin/import/card-replace',
   '/admin/import/card-replace-apply',
+  '/admin/import/card-low',
+  '/admin/import/card-replace-upload',
+  '/admin/import/card-remove',
+  '/admin/r2/delete',
 ]
 
 /** Langues demandées (`?language=fr,ja`), toutes par défaut ; `null` si une valeur est inconnue. */
@@ -295,12 +304,64 @@ export async function handleAdmin(request: Request, deps: AdminDeps): Promise<Re
         if (!isLanguage(language)) return json({ error: 'langue inconnue (fr ou ja)' }, 400)
         if (!target || target.length > 80 || !origin || origin.length > 400) return json({ error: 'target et origin attendus' }, 400)
         if (![place.x, place.y, place.w].every((v) => Number.isFinite(v) && v >= 0 && v <= 1) || place.w === 0) return json({ error: 'x, y, w : nombres entre 0 et 1' }, 400)
+        const expect = url.searchParams.get('expect') ?? undefined
+        if (expect !== undefined && expect !== EXPECT_NONE && (!expect.startsWith(IMAGES_PREFIX) || expect.length > 300)) return json({ error: `expect : clé R2 actuelle de l’image (sous ${IMAGES_PREFIX})` }, 400)
         const overlay = await readBody(request, 2_000_000)
         if (!overlay) return json({ error: 'corps PNG attendu (2 Mo au plus)' }, 413)
-        const outcome = await storeCardOverlay(db, deps.bucket, config, deps.fetcher, { language, target, origin, place, overlay, dryRun: url.searchParams.get('dryRun') === '1' }, now)
+        const outcome = await storeCardOverlay(db, deps.bucket, config, deps.fetcher, { language, target, origin, place, overlay, dryRun: url.searchParams.get('dryRun') === '1', expect }, now)
         if (outcome.status === 'preview') return new Response(outcome.bytes, { headers: { 'content-type': 'image/webp', ...SECURITY_HEADERS } })
+        const status = { staged: 201, replaced: 200, stored: 201, reconciled: 200, unchanged: 200, conflict: 409, not_found: 404, invalid: 422, source_not_found: 424, source_refused: 424, source_error: 502 }[outcome.status]
+        return json(outcome, status)
+      }
+      if (path === '/admin/import/card-replace-upload') {
+        const language = url.searchParams.get('language')
+        const target = url.searchParams.get('target') ?? ''
+        const expect = url.searchParams.get('expect') ?? ''
+        const source = url.searchParams.get('source') ?? ''
+        if (!isLanguage(language)) return json({ error: 'langue inconnue (fr ou ja)' }, 400)
+        if (!target || target.length > 80) return json({ error: 'target manquant' }, 400)
+        if (expect !== EXPECT_NONE && (!expect.startsWith(IMAGES_PREFIX) || expect.length > 300)) return json({ error: `expect : clé R2 actuelle de l’image (sous ${IMAGES_PREFIX}) ou « ${EXPECT_NONE} »` }, 400)
+        if (!/^traitement:\S{1,400}$/.test(source)) return json({ error: 'source : « traitement:<origine> » attendu' }, 400)
+        if (!deps.mediaImages) return json({ error: 'conversion d’images indisponible' }, 500)
+        const bytes = await readBody(request, config.maxImageBytes)
+        if (!bytes) return json({ error: `corps WebP attendu (${config.maxImageBytes} octets au plus)` }, 413)
+        const outcome = await replaceCardFromUpload(db, deps.bucket, config, deps.mediaImages, { language, target, expect, source, bytes, apply: flagParam(url, 'apply') }, now)
+        const status = { staged: 201, replaced: 200, stored: 201, reconciled: 200, unchanged: 200, conflict: 409, not_found: 404, invalid: 422, source_not_found: 424, source_refused: 424, source_error: 502 }[outcome.status]
+        return json(outcome, status)
+      }
+      if (path === '/admin/import/card-low') {
+        const language = url.searchParams.get('language')
+        const target = url.searchParams.get('target') ?? ''
+        if (!isLanguage(language)) return json({ error: 'langue inconnue (fr ou ja)' }, 400)
+        if (!target || target.length > 80) return json({ error: 'target manquant' }, 400)
+        if (!deps.mediaImages) return json({ error: 'conversion d’images indisponible' }, 500)
+        const outcome = await storeLowFromMain(db, deps.bucket, config, deps.mediaImages, { language, target }, now)
         const status = { stored: 201, reconciled: 200, unchanged: 200, conflict: 409, not_found: 404, invalid: 422, source_not_found: 424, source_refused: 424, source_error: 502 }[outcome.status]
         return json(outcome, status)
+      }
+      if (path === '/admin/import/card-remove') {
+        const language = url.searchParams.get('language')
+        const target = url.searchParams.get('target') ?? ''
+        const expect = url.searchParams.get('expect') ?? ''
+        const reason = (url.searchParams.get('reason') ?? '').trim()
+        if (!isLanguage(language)) return json({ error: 'langue inconnue (fr ou ja)' }, 400)
+        if (!target || target.length > 80) return json({ error: 'target manquant' }, 400)
+        if (!expect.startsWith(IMAGES_PREFIX) || expect.length > 300) return json({ error: `expect : clé R2 actuelle de l’image (sous ${IMAGES_PREFIX})` }, 400)
+        if (!reason || reason.length > 300) return json({ error: 'reason : motif du retrait (300 caractères au plus)' }, 400)
+        const outcome = await removeCardImage(db, { language, target, expect, reason }, now)
+        return json(outcome, { removed: 200, conflict: 409, not_found: 404 }[outcome.status])
+      }
+      if (path === '/admin/r2/delete') {
+        const body = await readBody(request, 200_000)
+        if (!body) return json({ error: 'corps JSON attendu (200 Ko au plus)' }, 413)
+        let keys: unknown
+        try {
+          keys = (JSON.parse(new TextDecoder().decode(body)) as { keys?: unknown }).keys
+        } catch {
+          return json({ error: 'JSON illisible' }, 400)
+        }
+        if (!Array.isArray(keys) || keys.length === 0 || keys.length > MAX_DELETE_KEYS) return json({ error: `keys : liste de 1 à ${MAX_DELETE_KEYS} clés` }, 400)
+        return json(await deleteUnreferenced(db, deps.bucket, keys))
       }
       if (path === '/admin/import/card') {
         const language = url.searchParams.get('language')
@@ -318,7 +379,7 @@ export async function handleAdmin(request: Request, deps: AdminDeps): Promise<Re
         const expect = url.searchParams.get('expect') ?? ''
         if (!isLanguage(language)) return json({ error: 'langue inconnue (fr ou ja)' }, 400)
         if (!target || target.length > 80) return json({ error: 'target manquant' }, 400)
-        if (!expect.startsWith(IMAGES_PREFIX) || expect.length > 300) return json({ error: `expect : clé R2 actuelle de l’image (sous ${IMAGES_PREFIX})` }, 400)
+        if (expect !== EXPECT_NONE && (!expect.startsWith(IMAGES_PREFIX) || expect.length > 300)) return json({ error: `expect : clé R2 actuelle de l’image (sous ${IMAGES_PREFIX}) ou « ${EXPECT_NONE} »` }, 400)
         let outcome
         if (path === '/admin/import/card-replace') {
           if (!deps.mediaImages) return json({ error: 'liaison Images absente : conversion impossible' }, 500)

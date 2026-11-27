@@ -38,6 +38,8 @@ export async function runImageJob(ctx: JobContext, job: Job, card: CardForJob | 
   const { db, bucket, client, config } = ctx
   if (!card) return { kind: 'failed', error: `carte ${job.card_id ?? job.target_id} inconnue en base`, httpStatus: null }
   if (isValidImageStatus(card.image_status) && card.image_r2_key) return { kind: 'done', statements: [] }
+  // Image retirée à la main (règles de qualité) : la carte reste sans image.
+  if (card.image_provider !== null) return { kind: 'done', statements: [] }
 
   const key = cardImageKey(language, card.set_tcgdex_id ?? NO_SET, card.tcgdex_id)
   /** La petite image de la carte, remise en file avec chaque réussite (`reviveLowImageStmt`). */

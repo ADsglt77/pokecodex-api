@@ -139,6 +139,7 @@ export async function retryMissing(db: Db, config: Config, nowMs: number, langua
     const cards = await db.all<{ tcgdex_id: string }>(
       `SELECT c.tcgdex_id FROM cards c
        WHERE c.language = ?1 AND c.removed_at IS NULL
+         AND c.image_provider IS NULL
          AND (c.image_status IN (SELECT value FROM json_each(?2))
            OR (c.image_status = 'pending' AND NOT EXISTS (
              SELECT 1 FROM import_jobs j WHERE j.dedupe_key = 'image:' || c.language || ':' || c.tcgdex_id

@@ -71,7 +71,7 @@ export async function runCardJob(ctx: JobContext, job: Job, known: CardForJob | 
   // désormais une URL officielle pour une carte encore sans image valide.
   const orphan = !known || orphanJob
   const newOfficialImage = detail.image !== null && detail.image !== known?.api_image_url
-  if (orphan || (known && !isValidImageStatus(known.image_status) && newOfficialImage)) {
+  if (orphan || (known && !isValidImageStatus(known.image_status) && known.image_provider === null && newOfficialImage)) {
     statements.push(...enqueueStmts(db, 'image', language, [imageJob(language, detail.id)], { runId: job.run_id, maxAttempts: config.maxAttempts, nowMs }))
   }
   // Extension absente de la liste officielle : son détail donne la série (chemin des images).

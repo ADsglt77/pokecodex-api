@@ -247,12 +247,14 @@ export interface ExistingCard {
   removed_at: string | null
   image_low_status: MediaStatus | null
   image_low_checked_at: string | null
+  /** Non NULL : image gérée par l'API d'import (ajoutée, remplacée ou retirée à la main) ; la synchronisation n'y touche pas. */
+  image_provider: string | null
 }
 
 export function existingCardsOfSet(db: Db, setInternalId: string): Promise<ExistingCard[]> {
   return db.all<ExistingCard>(
     `SELECT id, tcgdex_id, brief_hash, detail_status, detail_fetched_at, image_status, image_checked_at,
-       api_image_url, series_id, removed_at, image_low_status, image_low_checked_at
+       api_image_url, series_id, removed_at, image_low_status, image_low_checked_at, image_provider
      FROM cards WHERE set_id = ?1`,
     setInternalId,
   )
@@ -356,6 +358,8 @@ export interface CardForJob {
   image_sha256: string | null
   image_low_status: MediaStatus | null
   image_low_r2_key: string | null
+  /** Non NULL : image gérée par l'API d'import (voir `ExistingCard.image_provider`). */
+  image_provider: string | null
 }
 
 /** Lit en une requête les cartes de plusieurs tâches. */
@@ -365,7 +369,7 @@ export async function cardsForJobs(db: Db, cardIds: string[]): Promise<Map<strin
     `SELECT c.id, c.tcgdex_id, c.language, c.name, c.local_id, c.set_id, s.tcgdex_id AS set_tcgdex_id,
        COALESCE(c.series_id, se.tcgdex_id) AS series_id, s.logo_url AS set_logo_url, s.symbol_url AS set_symbol_url,
        c.api_image_url, c.image_status, c.image_r2_key, c.image_checked_at, c.detail_status,
-       c.image_source_url, c.image_quality, c.image_sha256, c.image_low_status, c.image_low_r2_key
+       c.image_source_url, c.image_quality, c.image_sha256, c.image_low_status, c.image_low_r2_key, c.image_provider
      FROM cards c
      LEFT JOIN sets s ON s.id = c.set_id
      LEFT JOIN series se ON se.id = s.series_id

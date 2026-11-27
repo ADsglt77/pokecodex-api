@@ -11,7 +11,9 @@ sur un Worker Cloudflare indépendant (`pokecodex-importer`). Tout le fonctionne
   bases D1 `pokedex-data` et `pokecodex`, domaine `pokecodex.fr`, DNS, routes.
 - Le bucket R2 `pokedex-data` est **partagé** avec la production (préfixes `images/`, `snapshots/`) :
   l'importateur n'écrit et ne lit que sous `cards/` et `reports/` (constantes `IMAGES_PREFIX`,
-  `REPORTS_PREFIX` de `src/config.ts`). Aucune suppression massive, jamais. Le bucket reste privé.
+  `REPORTS_PREFIX` de `src/config.ts`). Aucune suppression massive sans accord écrit de l'utilisateur
+  (seule exception, 27/11/2026 : les anciennes versions d'images qu'aucune ligne de D1 ne référence
+  plus, par `POST /admin/r2/delete`, qui refuse toute clé encore utilisée). Le bucket reste privé.
 - Aucun secret dans Git : `ADMIN_TOKEN` est un secret Wrangler ; sa copie locale est
   `.secrets/admin-token.txt` (ignoré par Git). Ne jamais l'afficher dans une réponse.
 - Aucune donnée de marché : les objets `pricing` de TCGdex sont retirés avant stockage.
@@ -30,6 +32,10 @@ sur un Worker Cloudflare indépendant (`pokecodex-importer`). Tout le fonctionne
   `reconstitution:<l>/<origine>` ou `reconstitution:<adresse>`.
   Remplacement d'une image existante (`POST /admin/import/card-replace` puis `card-replace-apply`,
   26/11/2026) : nouvelle clé `<carte>.p<sha>.webp`, bascule conditionnée par `expect`, ancien objet gardé.
+  Règles de qualité de l'utilisateur (27/11/2026) : pas de photo, pas de filigrane, pas de scan faible ;
+  une image moche est retirée (`POST /admin/import/card-remove`, la carte reste sans image) plutôt que
+  gardée. `image_provider` non NULL = image gérée par l'API d'import : la synchronisation TCGdex n'y
+  touche jamais (`needsImage`, `runCardJob`, `runImageJob`, `retryMissing`).
 
 ## Environnement
 
@@ -75,7 +81,8 @@ convertirait `/admin/…` en chemin Windows).
   (`/assets/images/symboles[_jp]/<code>.png`), et `POST /admin/import/logo` accepte un logo TCGdex
   d'une autre langue (`/<langue>/<série>/<ext>/logo.webp|png`) ou un PNG de Poképédia, 52poke ou
   Bulbagarden (autorisés le 25/11/2026) ; `POST /admin/import/card` accepte `www.pokepedia.fr`
-  (`/images/<h>/<hh>/<fichier>.png|jpg`) et `assets.pokemon.com` (`CARD_SOURCES`). Ajouter un hôte =
+  (`/images/<h>/<hh>/<fichier>.png|jpg`), `assets.pokemon.com` et, depuis le 27/11/2026, les rendus FR de
+  Limitless (`limitlesstcg.nyc3.cdn.digitaloceanspaces.com/tpci/<SET>/<SET>_<NNN>_R_FR.png`) (`CARD_SOURCES`). Ajouter un hôte =
   accord de l'utilisateur d'abord.
 - **Conversion d'images** : dans le Worker lui-même, par les codecs WebAssembly jSquash
   (`src/services/wasm-images.ts` : PNG, JPEG, WebP, redimensionnement lanczos3, `ImageData` simulé),

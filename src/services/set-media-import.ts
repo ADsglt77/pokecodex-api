@@ -255,6 +255,15 @@ export const CARD_SOURCES: readonly MediaSource[] = [
     types: ['image/png'],
     md5Etag: false,
   },
+  // Rendus FR officiels de Limitless (autorisé par l'utilisateur le 27/11/2026), ex. /tpci/SP/SP_073_R_FR.png.
+  {
+    host: 'limitlesstcg.nyc3.cdn.digitaloceanspaces.com',
+    path: /^\/tpci\/[A-Z0-9]{2,8}\/[A-Z0-9]{2,8}_[A-Z0-9]{1,6}_R_FR\.png$/,
+    provider: MANUAL_SOURCE,
+    accept: 'image/png',
+    types: ['image/png'],
+    md5Etag: false,
+  },
 ]
 /** Image principale : côté long plafonné, WebP avec perte (comme les images de TCGdex). */
 const CARD_MAIN = { maxSide: 1024, quality: 90 }
@@ -331,9 +340,12 @@ export interface CardOverlayRequest {
   overlay: Uint8Array
   /** Rend l'image composée sans rien écrire. */
   dryRun: boolean
+  /** Clé R2 actuelle de l'image principale : la carte a déjà une image, que la reconstitution remplace
+   *  (nouvelle clé `.p<sha>`, bascule conditionnée comme `card-replace`, ancien objet gardé). */
+  expect?: string
 }
 
-export type CardOverlayOutcome = (SetMediaOutcome & { low?: string }) | { status: 'preview'; bytes: Uint8Array }
+export type CardOverlayOutcome = (SetMediaOutcome & { low?: string }) | CardReplaceOutcome | { status: 'preview'; bytes: Uint8Array }
 
 /**
  * Image reconstituée d'une carte : l'image de sa carte d'origine (même illustration, même texte),
@@ -353,7 +365,9 @@ export async function storeCardOverlay(
   const source = fromUrl ? pickSource(CARD_SOURCES, request.origin, 'une image de carte') : null
   const card = await db.first<{ image_status: string; image_r2_key: string | null }>(`SELECT image_status, image_r2_key FROM cards WHERE id = ?1`, internalId(request.language, request.target))
   if (!card) return { status: 'not_found', reason: `carte ${request.language}/${request.target} inconnue` }
-  if (!request.dryRun && VALID.includes(card.image_status) && card.image_r2_key) return { status: 'unchanged', key: card.image_r2_key, reason: 'image déjà présente' }
+  const replace = request.expect ? await replaceTarget(db, request.language, request.target, request.expect) : null
+  if (replace && 'status' in replace) return replace
+  if (!replace && !request.dryRun && VALID.includes(card.image_status) && card.image_r2_key) return { status: 'unchanged', key: card.image_r2_key, reason: 'image déjà présente' }
   let base: Uint8Array
   if (source) {
     const download = await downloadSource(db, fetcher, source, request.origin, config, now)
@@ -371,6 +385,11 @@ export async function storeCardOverlay(
   if (!main || !low) throw new Error('composition incomplète')
   if (request.dryRun) return { status: 'preview', bytes: main }
   const sourceUrl = fromUrl ? `reconstitution:${request.origin}` : `reconstitution:${request.language}/${request.origin}`
+  if (replace && request.expect) {
+    const staged = await stageCardImages(db, bucket, config, replace, main, low, { sourceUrl, replaces: request.expect })
+    if ('status' in staged) return staged
+    return applyCardReplacement(db, bucket, { language: request.language, target: request.target, key: staged.key, expect: request.expect }, now)
+  }
   const stored = await storeImage(db, bucket, config, { kind: 'main', language: request.language, target: request.target, sourceUrl, bytes: main }, now())
   if (!['stored', 'reconciled', 'unchanged'].includes(stored.status)) return stored
   const lowStored = await storeImage(db, bucket, config, { kind: 'low', language: request.language, target: request.target, sourceUrl, bytes: low }, now())
@@ -411,6 +430,9 @@ interface ReplaceRow {
   image_r2_key: string | null
 }
 
+/** `expect` pour une carte sans image (retirée ou jamais copiée) : l'image préparée devient sa première image. */
+export const EXPECT_NONE = 'aucune'
+
 /** La carte, si son image actuelle est bien celle attendue ; sinon l'issue à renvoyer. */
 async function replaceTarget(db: Db, language: Language, target: string, expect: string): Promise<{ row: ReplaceRow & { set_tcgdex: string }; base: string } | SetMediaOutcome> {
   const row = await db.first<ReplaceRow>(
@@ -418,7 +440,8 @@ async function replaceTarget(db: Db, language: Language, target: string, expect:
     internalId(language, target),
   )
   if (!row || !row.set_tcgdex) return { status: 'not_found', reason: `carte ${language}/${target} inconnue` }
-  if (!VALID.includes(row.image_status) || row.image_r2_key !== expect) {
+  const matches = expect === EXPECT_NONE ? !VALID.includes(row.image_status) && row.image_r2_key === null : VALID.includes(row.image_status) && row.image_r2_key === expect
+  if (!matches) {
     return { status: 'conflict', reason: `image actuelle ${row.image_r2_key ?? 'absente'} ≠ attendue ${expect} : rien n’est remplacé` }
   }
   const base = cardImageKey(language, row.set_tcgdex, row.tcgdex_id).slice(0, -'.webp'.length)
@@ -470,6 +493,55 @@ export async function replaceCardImage(
   if (size.width < CARD_MIN_SIDE || size.height < CARD_MIN_SIDE) return { status: 'invalid', reason: `image trop petite (${size.width}×${size.height})` }
   const main = await images.toWebp(bytes, CARD_MAIN.maxSide, CARD_MAIN.quality)
   const low = await images.toWebp(bytes, CARD_LOW.maxSide, CARD_LOW.quality)
+  const staged = await stageCardImages(db, bucket, config, target, main, low, { sourceUrl: request.sourceUrl, replaces: request.expect, width: String(size.width), height: String(size.height) })
+  if ('status' in staged) return staged
+  if (request.apply) return applyCardReplacement(db, bucket, { language: request.language, target: request.target, key: staged.key, expect: request.expect }, now)
+  return { status: 'staged', ...staged, width: size.width, height: size.height }
+}
+
+/**
+ * Remplace l'image d'une carte par un WebP envoyé (image retraitée sur le poste de l'administrateur :
+ * normalisation, agrandissement, réparation des bordures ; accord de l'utilisateur du 27/11/2026). Même
+ * mécanisme que `replaceCardImage` : nouvelle clé `.p<sha>`, petite image calculée ici, bascule si `apply`.
+ */
+export async function replaceCardFromUpload(
+  db: Db,
+  bucket: R2Bucket,
+  config: Pick<Config, 'minImageBytes' | 'maxImageBytes'>,
+  images: SetMediaImages,
+  request: { language: Language; target: string; expect: string; source: string; bytes: Uint8Array; apply: boolean },
+  now: () => number,
+): Promise<CardReplaceOutcome> {
+  const target = await replaceTarget(db, request.language, request.target, request.expect)
+  if ('status' in target) return target
+  if (!isWebp(request.bytes)) return { status: 'invalid', reason: 'WebP attendu (signature absente)' }
+  let size: { width: number; height: number }
+  try {
+    size = await images.info(request.bytes)
+  } catch (error) {
+    if (!isFileImageError(error)) throw error
+    return { status: 'invalid', reason: `image illisible : ${errorMessage(error)}` }
+  }
+  if (size.width < CARD_MIN_SIDE || size.height < CARD_MIN_SIDE || Math.max(size.width, size.height) > CARD_MAIN.maxSide) {
+    return { status: 'invalid', reason: `dimensions refusées (${size.width}×${size.height}) : côté long de ${CARD_MIN_SIDE} à ${CARD_MAIN.maxSide} px` }
+  }
+  const low = await images.toWebp(request.bytes, CARD_LOW.maxSide, CARD_LOW.quality)
+  const staged = await stageCardImages(db, bucket, config, target, request.bytes, low, { sourceUrl: request.source, replaces: request.expect, width: String(size.width), height: String(size.height) })
+  if ('status' in staged) return staged
+  if (request.apply) return applyCardReplacement(db, bucket, { language: request.language, target: request.target, key: staged.key, expect: request.expect }, now)
+  return { status: 'staged', ...staged, width: size.width, height: size.height }
+}
+
+/** Écrit image principale et petite image sous la nouvelle clé `<carte>.p<sha>.webp` (jamais d'écrasement). */
+async function stageCardImages(
+  db: Db,
+  bucket: R2Bucket,
+  config: Pick<Config, 'minImageBytes' | 'maxImageBytes'>,
+  target: { row: ReplaceRow; base: string },
+  main: Uint8Array,
+  low: Uint8Array,
+  meta: { sourceUrl: string; replaces: string } & Record<string, string>,
+): Promise<{ key: string; lowKey: string; size: number; sha256: string } | SetMediaOutcome> {
   const webp = (b: Uint8Array) => checkWebp(b, new Headers({ 'content-type': 'image/webp', 'content-length': String(b.byteLength) }), config)
   const [mainCheck, lowCheck] = [await webp(main), await webp(low)]
   if (!mainCheck.ok) return { status: 'invalid', reason: `conversion : ${mainCheck.reason}` }
@@ -477,13 +549,12 @@ export async function replaceCardImage(
   const key = `${target.base}.p${mainCheck.sha256.slice(0, 12)}.webp`
   const lowKey = lowImageKey(key)
   if (!lowKey) throw new Error(`clé de petite image impossible : ${key}`)
-  const meta = { tcgdexId: target.row.tcgdex_id, sourceUrl: request.sourceUrl, replaces: request.expect, width: String(size.width), height: String(size.height) }
-  const mainSize = await putOnce(db, bucket, key, main, mainCheck, { ...meta, quality: 'high' })
+  const common = { ...meta, tcgdexId: target.row.tcgdex_id }
+  const mainSize = await putOnce(db, bucket, key, main, mainCheck, { ...common, quality: 'high' })
   if (typeof mainSize === 'string') return { status: 'conflict', reason: mainSize }
-  const lowSize = await putOnce(db, bucket, lowKey, low, lowCheck, { ...meta, variant: 'low' })
+  const lowSize = await putOnce(db, bucket, lowKey, low, lowCheck, { ...common, variant: 'low' })
   if (typeof lowSize === 'string') return { status: 'conflict', reason: lowSize }
-  if (request.apply) return applyCardReplacement(db, bucket, { language: request.language, target: request.target, key, expect: request.expect }, now)
-  return { status: 'staged', key, lowKey, size: mainSize, sha256: mainCheck.sha256, width: size.width, height: size.height }
+  return { key, lowKey, size: mainSize, sha256: mainCheck.sha256 }
 }
 
 /** Étape 2 : la carte passe sur l'image écrite à `key` par l'étape 1 (aucun téléchargement). */
@@ -495,7 +566,10 @@ export async function applyCardReplacement(
 ): Promise<CardReplaceOutcome> {
   const target = await replaceTarget(db, request.language, request.target, request.expect)
   if ('status' in target) return target
-  if (!request.key.startsWith(`${target.base}.p`) || !/\.p[0-9a-f]{12}\.webp$/.test(request.key)) {
+  // Nouvelle image préparée (`.p<sha>.webp`), ou retour à l'objet d'origine `<carte>.webp` gardé dans R2
+  // (27/11/2026 : ancienne version meilleure que l'image actuelle).
+  const original = request.key === `${target.base}.webp`
+  if (!original && (!request.key.startsWith(`${target.base}.p`) || !/\.p[0-9a-f]{12}\.webp$/.test(request.key))) {
     throw new InputError(`clé de remplacement inattendue pour ${request.language}/${request.target} : ${request.key}`)
   }
   const lowKey = lowImageKey(request.key)
@@ -516,7 +590,8 @@ export async function applyCardReplacement(
          image_tested_urls = '[]', image_http_status = NULL, image_failure_reason = NULL, image_provider = ?8,
          image_low_status = 'downloaded', image_low_r2_key = ?9, image_low_checked_at = ?7, image_low_file_size = ?10,
          image_low_sha256 = ?11, image_low_failure_reason = NULL, updated_at = ?7
-       WHERE id = ?1 AND image_r2_key = ?2 AND image_status IN ('downloaded', 'recovered_from_cdn', 'already_present')`,
+       WHERE id = ?1 AND (CASE WHEN ?2 = '${EXPECT_NONE}' THEN image_r2_key IS NULL AND image_status NOT IN ('downloaded', 'recovered_from_cdn', 'already_present')
+         ELSE image_r2_key = ?2 AND image_status IN ('downloaded', 'recovered_from_cdn', 'already_present') END)`,
       target.row.id,
       request.expect,
       mainMeta.sourceUrl,
@@ -532,6 +607,125 @@ export async function applyCardReplacement(
   ])
   if (!res[0]?.meta.changes) return { status: 'conflict', reason: 'la carte a changé entre-temps : rien n’est remplacé' }
   return { status: 'replaced', key: request.key, lowKey, size: main.size, sha256: mainMeta.sha256 }
+}
+
+// ——— Petite image, retrait d'image, anciennes versions (27/11/2026, règles de qualité de l'utilisateur) ———
+
+/**
+ * Petite image d'une carte qui n'en a pas, calculée à partir de son image principale déjà dans R2
+ * (ex. TCGdex sans `low.webp`) : clé `<principale>.low.webp`, jamais d'écrasement.
+ */
+export async function storeLowFromMain(
+  db: Db,
+  bucket: R2Bucket,
+  config: Pick<Config, 'minImageBytes' | 'maxImageBytes'>,
+  images: SetMediaImages,
+  request: { language: Language; target: string },
+  now: () => number,
+): Promise<SetMediaOutcome> {
+  const row = await db.first<{ id: string; tcgdex_id: string; image_status: string; image_r2_key: string | null; image_low_status: string | null; image_low_r2_key: string | null }>(
+    `SELECT id, tcgdex_id, image_status, image_r2_key, image_low_status, image_low_r2_key FROM cards WHERE id = ?1`,
+    internalId(request.language, request.target),
+  )
+  if (!row) return { status: 'not_found', reason: `carte ${request.language}/${request.target} inconnue` }
+  if (!VALID.includes(row.image_status) || !row.image_r2_key) return { status: 'not_found', reason: 'carte sans image principale' }
+  if (row.image_low_status === 'downloaded') return { status: 'unchanged', key: row.image_low_r2_key, reason: 'petite image déjà présente' }
+  const lowKey = lowImageKey(row.image_r2_key)
+  if (!lowKey || lowKey === row.image_r2_key) return { status: 'conflict', reason: `clé principale inattendue : ${row.image_r2_key}` }
+  db.usage.r2Reads++
+  const object = await bucket.get(row.image_r2_key)
+  if (!object) return { status: 'not_found', reason: `objet R2 absent : ${row.image_r2_key}` }
+  const low = await images.toWebp(new Uint8Array(await object.arrayBuffer()), CARD_LOW.maxSide, CARD_LOW.quality)
+  const check = await checkWebp(low, new Headers({ 'content-type': 'image/webp', 'content-length': String(low.byteLength) }), config)
+  if (!check.ok) return { status: 'invalid', reason: `conversion : ${check.reason}` }
+  const size = await putOnce(db, bucket, lowKey, low, check, { tcgdexId: row.tcgdex_id, variant: 'low', sourceUrl: `r2:${row.image_r2_key}` })
+  if (typeof size === 'string') return { status: 'conflict', reason: size }
+  const at = iso(now())
+  const res = await db.batch([
+    db.stmt(
+      `UPDATE cards SET image_low_status = 'downloaded', image_low_r2_key = ?3, image_low_checked_at = ?4, image_low_file_size = ?5,
+         image_low_sha256 = ?6, image_low_failure_reason = NULL, updated_at = ?4
+       WHERE id = ?1 AND image_r2_key = ?2 AND image_low_status IS NOT 'downloaded'`,
+      row.id,
+      row.image_r2_key,
+      lowKey,
+      at,
+      size,
+      check.sha256,
+    ),
+  ])
+  return res[0]?.meta.changes ? { status: 'stored', key: lowKey, size, sha256: check.sha256 } : { status: 'conflict', reason: 'la carte a changé entre-temps' }
+}
+
+/**
+ * Retire l'image d'une carte (photo, scan faible, carte en anglais…) : la carte reste sans image, et
+ * `image_provider` est posé pour que la synchronisation TCGdex ne la remette jamais. L'objet R2 n'est
+ * pas effacé ici (voir `deleteUnreferenced`).
+ */
+export async function removeCardImage(
+  db: Db,
+  request: { language: Language; target: string; expect: string; reason: string },
+  now: () => number,
+): Promise<{ status: 'removed'; key: string } | { status: 'conflict' | 'not_found'; reason: string }> {
+  const row = await db.first<{ id: string; image_status: string; image_r2_key: string | null }>(
+    `SELECT id, image_status, image_r2_key FROM cards WHERE id = ?1`,
+    internalId(request.language, request.target),
+  )
+  if (!row) return { status: 'not_found', reason: `carte ${request.language}/${request.target} inconnue` }
+  if (!VALID.includes(row.image_status) || row.image_r2_key !== request.expect) {
+    return { status: 'conflict', reason: `image actuelle ${row.image_r2_key ?? 'absente'} ≠ attendue ${request.expect} : rien n’est retiré` }
+  }
+  const at = iso(now())
+  const res = await db.batch([
+    db.stmt(
+      `UPDATE cards SET image_status = 'missing_api_url', image_source = NULL, image_source_url = NULL, image_r2_key = NULL,
+         image_quality = NULL, image_file_size = NULL, image_sha256 = NULL, image_downloaded_at = NULL, image_checked_at = ?3,
+         image_tested_urls = '[]', image_http_status = NULL, image_failure_reason = ?4, image_provider = ?5,
+         image_low_status = NULL, image_low_r2_key = NULL, image_low_checked_at = NULL, image_low_file_size = NULL,
+         image_low_sha256 = NULL, image_low_failure_reason = NULL, updated_at = ?3
+       WHERE id = ?1 AND image_r2_key = ?2`,
+      row.id,
+      request.expect,
+      at,
+      `image retirée (règles de qualité) : ${request.reason}`,
+      MANUAL_SOURCE,
+    ),
+  ])
+  return res[0]?.meta.changes ? { status: 'removed', key: request.expect } : { status: 'conflict', reason: 'la carte a changé entre-temps' }
+}
+
+/** Clés d'objets au plus par appel de `deleteUnreferenced`. */
+export const MAX_DELETE_KEYS = 500
+
+/**
+ * Efface des objets R2 d'images de cartes qu'aucune ligne de D1 ne référence plus (anciennes versions
+ * remplacées, images retirées), avec l'accord de l'utilisateur du 27/11/2026. Une clé encore utilisée
+ * (image principale, petite image, logo, symbole) ou hors de `cards/` est refusée.
+ */
+export async function deleteUnreferenced(db: Db, bucket: R2Bucket, keys: unknown[]): Promise<{ deleted: number; refused: { key: string; reason: string }[] }> {
+  if (keys.length > MAX_DELETE_KEYS) throw new InputError(`${MAX_DELETE_KEYS} clés au plus`)
+  const refused: { key: string; reason: string }[] = []
+  const candidates: string[] = []
+  for (const key of new Set(keys)) {
+    if (typeof key === 'string' && key.startsWith(IMAGES_PREFIX) && !key.includes('..') && !key.includes('//') && key.endsWith('.webp')) candidates.push(key)
+    else refused.push({ key: String(key), reason: `hors de ${IMAGES_PREFIX} ou pas une image WebP` })
+  }
+  if (!candidates.length) return { deleted: 0, refused }
+  const used = await db.all<{ k: string }>(
+    `SELECT image_r2_key AS k FROM cards WHERE image_r2_key IN (SELECT value FROM json_each(?1))
+     UNION SELECT image_low_r2_key FROM cards WHERE image_low_r2_key IN (SELECT value FROM json_each(?1))
+     UNION SELECT logo_r2_key FROM sets WHERE logo_r2_key IN (SELECT value FROM json_each(?1))
+     UNION SELECT symbol_r2_key FROM sets WHERE symbol_r2_key IN (SELECT value FROM json_each(?1))`,
+    JSON.stringify(candidates),
+  )
+  const inUse = new Set(used.map((row) => row.k))
+  const doomed = candidates.filter((key) => !inUse.has(key))
+  for (const key of candidates) if (inUse.has(key)) refused.push({ key, reason: 'encore utilisée par D1' })
+  if (doomed.length) {
+    db.usage.r2Writes++
+    await bucket.delete(doomed)
+  }
+  return { deleted: doomed.length, refused }
 }
 
 /** Source d'une adresse parmi `sources` ; `InputError` (400) si l'adresse n'est pas exactement au format attendu. */
